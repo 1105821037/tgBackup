@@ -9,7 +9,6 @@ data/media/
 data/profile.key
 data/*.log
 frontend/node_modules/
-frontend/dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
