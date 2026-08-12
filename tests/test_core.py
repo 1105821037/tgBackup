@@ -20,6 +20,7 @@ from backend.app.backup_service import (
     forward_metadata,
 )
 from backend.app.models import ChatBackupRule
+from backend.app.origin_utils import is_allowed_browser_origin
 from backend.app.message_content import serialize_message_content
 from backend.app.media_downloader import _prepare_parts, parallel_download_file
 from backend.app.realtime import RealtimeHub
@@ -141,6 +142,22 @@ def test_phone_mask_and_local_origins() -> None:
     assert "13800000000" not in mask_phone("+8613800000000")
     assert "http://localhost:5173" in get_settings().allowed_frontend_origins
     assert "http://127.0.0.1:5173" in get_settings().allowed_frontend_origins
+
+
+def test_browser_origin_accepts_current_host_and_rejects_foreign_hosts() -> None:
+    configured = ["http://localhost:5173"]
+    assert is_allowed_browser_origin(
+        "http://127.0.0.1:8000", "127.0.0.1:8000", configured
+    )
+    assert is_allowed_browser_origin(
+        "https://backup.example.com", "backup.example.com", configured
+    )
+    assert is_allowed_browser_origin(
+        "http://localhost:5173", "127.0.0.1:8000", configured
+    )
+    assert not is_allowed_browser_origin(
+        "https://evil.example", "backup.example.com", configured
+    )
 
 
 def test_media_connection_limit_uses_premium_tier(

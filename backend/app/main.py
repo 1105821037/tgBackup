@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import get_settings
 from .backup_scheduler import coordinator
 from .entity_service import entity_refresh_coordinator
+from .origin_utils import is_allowed_browser_origin
 from .routes_auth import router as auth_router
 from .routes_archive import router as archive_router
 from .routes_backups import router as backups_router
@@ -52,7 +53,11 @@ app.add_middleware(
 async def reject_foreign_browser_origins(request: Request, call_next):
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
-        if origin and origin.rstrip("/") not in settings.allowed_frontend_origins:
+        if origin and not is_allowed_browser_origin(
+            origin,
+            request.headers.get("host"),
+            settings.allowed_frontend_origins,
+        ):
             return JSONResponse(status_code=403, content={"detail": "不允许的请求来源"})
     return await call_next(request)
 

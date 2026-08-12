@@ -11,6 +11,7 @@ from sqlalchemy import select
 from .config import get_settings
 from .db import SessionLocal
 from .models import WebSession
+from .origin_utils import is_allowed_browser_origin
 from .realtime import realtime_hub
 from .security import SESSION_COOKIE, digest
 from .telegram_runtime import runtime_manager
@@ -43,7 +44,11 @@ async def receive_message(websocket: WebSocket) -> dict[str, Any]:
 @router.websocket("/api/ws")
 async def realtime_socket(websocket: WebSocket) -> None:
     origin = websocket.headers.get("origin", "").rstrip("/")
-    if origin not in settings.allowed_frontend_origins:
+    if not is_allowed_browser_origin(
+        origin,
+        websocket.headers.get("host"),
+        settings.allowed_frontend_origins,
+    ):
         await websocket.close(code=4403, reason="origin_not_allowed")
         return
     session_token = websocket.cookies.get(SESSION_COOKIE)
