@@ -13,7 +13,12 @@ from telethon import TelegramClient, errors
 
 from .config import get_settings
 from .models import TelegramAccount, TelegramLoginAttempt, User
-from .telegram_runtime import create_client, runtime_manager
+from .telegram_runtime import (
+    account_session_stem,
+    candidate_session_stem,
+    create_client,
+    runtime_manager,
+)
 
 
 settings = get_settings()
@@ -24,10 +29,12 @@ def client_for(session_stem: str | Path) -> TelegramClient:
     return create_client(session_stem, receive_updates=False)
 
 
-def safe_remove_candidate(session_stem: str) -> None:
-    root = settings.account_sessions_root.resolve()
-    stem = Path(session_stem).resolve()
-    if not stem.is_relative_to(root):
+def safe_remove_candidate(user_id: int, candidate_key: str) -> None:
+    try:
+        stem = candidate_session_stem(
+            settings.account_sessions_root, user_id, candidate_key
+        )
+    except ValueError:
         return
     for suffix in (".session", ".session-journal"):
         path = stem.with_suffix(suffix)
@@ -40,8 +47,8 @@ def cleanup_orphaned_candidates(user_id: int) -> None:
     if not pending.exists():
         return
     for path in pending.glob(f"user_{user_id}_*.session*"):
-        stem_name = path.name.split(".session", 1)[0]
-        safe_remove_candidate(str(pending / stem_name))
+        candidate_key = path.name.split(".session", 1)[0]
+        safe_remove_candidate(user_id, candidate_key)
 
 
 def mask_phone(phone: str) -> str:
@@ -59,7 +66,9 @@ async def live_status(db: AsyncSession, user: User) -> dict[str, object]:
     if not account:
         return {"state": "unbound", "immutable_binding": True}
 
-    session_file = Path(account.session_path).with_suffix(".session")
+    session_file = account_session_stem(
+        settings.account_sessions_root, user.id
+    ).with_suffix(".session")
     if not session_file.exists():
         account.status = "login_required"
         account.last_checked_at = datetime.now(timezone.utc)
@@ -100,7 +109,7 @@ async def begin_login(db: AsyncSession, user: User, phone: str) -> dict[str, obj
         select(TelegramLoginAttempt).where(TelegramLoginAttempt.user_id == user.id)
     )
     if previous:
-        safe_remove_candidate(previous.candidate_session_path)
+        safe_remove_candidate(previous.user_id, previous.candidate_session_key)
         await db.delete(previous)
         await db.commit()
 
@@ -109,35 +118,38 @@ async def begin_login(db: AsyncSession, user: User, phone: str) -> dict[str, obj
 
     pending_dir = settings.account_sessions_root / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
-    candidate = pending_dir / f"user_{user.id}_{uuid.uuid4().hex}"
+    candidate_key = f"user_{user.id}_{uuid.uuid4().hex}"
+    candidate = candidate_session_stem(
+        settings.account_sessions_root, user.id, candidate_key
+    )
     client = client_for(candidate)
     try:
         async with asyncio.timeout(45):
             await client.connect()
             sent = await client.send_code_request(phone)
     except TimeoutError as exc:
-        safe_remove_candidate(str(candidate))
+        safe_remove_candidate(user.id, candidate_key)
         raise HTTPException(
             status_code=504,
             detail="Telegram 发码超时，请检查代理后重试",
         ) from exc
     except errors.PhoneNumberInvalidError as exc:
-        safe_remove_candidate(str(candidate))
+        safe_remove_candidate(user.id, candidate_key)
         raise HTTPException(status_code=422, detail="手机号格式无效") from exc
     except errors.FloodWaitError as exc:
-        safe_remove_candidate(str(candidate))
+        safe_remove_candidate(user.id, candidate_key)
         raise HTTPException(
             status_code=429, detail=f"Telegram 限流，请在 {exc.seconds} 秒后重试"
         ) from exc
     except (OSError, errors.RPCError) as exc:
-        safe_remove_candidate(str(candidate))
+        safe_remove_candidate(user.id, candidate_key)
         raise HTTPException(status_code=502, detail="无法连接 Telegram，请检查代理") from exc
     finally:
         await client.disconnect()
 
     attempt = TelegramLoginAttempt(
         user_id=user.id,
-        candidate_session_path=str(candidate.resolve()),
+        candidate_session_key=candidate_key,
         phone=phone,
         phone_code_hash=sent.phone_code_hash,
         stage="code_sent",
@@ -156,7 +168,7 @@ async def get_valid_attempt(db: AsyncSession, user_id: int) -> TelegramLoginAtte
         raise HTTPException(status_code=409, detail="请先请求 Telegram 验证码")
     expires = attempt.expires_at.replace(tzinfo=timezone.utc)
     if expires <= datetime.now(timezone.utc):
-        safe_remove_candidate(attempt.candidate_session_path)
+        safe_remove_candidate(attempt.user_id, attempt.candidate_session_key)
         await db.delete(attempt)
         await db.commit()
         raise HTTPException(status_code=410, detail="验证码已过期，请重新发送")
@@ -168,7 +180,13 @@ async def verify_code(
 ) -> dict[str, object]:
     attempt = await get_valid_attempt(db, user.id)
     await db.commit()
-    client = client_for(attempt.candidate_session_path)
+    client = client_for(
+        candidate_session_stem(
+            settings.account_sessions_root,
+            attempt.user_id,
+            attempt.candidate_session_key,
+        )
+    )
     try:
         async with asyncio.timeout(45):
             await client.connect()
@@ -205,7 +223,13 @@ async def verify_two_factor(
     if attempt.stage != "password_required":
         raise HTTPException(status_code=409, detail="当前登录流程不需要两步验证密码")
     await db.commit()
-    client = client_for(attempt.candidate_session_path)
+    client = client_for(
+        candidate_session_stem(
+            settings.account_sessions_root,
+            attempt.user_id,
+            attempt.candidate_session_key,
+        )
+    )
     try:
         async with asyncio.timeout(45):
             await client.connect()
@@ -230,7 +254,7 @@ async def finalize_binding(
     )
     telegram_user_id = int(getattr(me, "id"))
     if account and account.telegram_user_id != telegram_user_id:
-        safe_remove_candidate(attempt.candidate_session_path)
+        safe_remove_candidate(attempt.user_id, attempt.candidate_session_key)
         await db.delete(attempt)
         await db.commit()
         raise HTTPException(
@@ -238,9 +262,13 @@ async def finalize_binding(
             detail="该系统用户已绑定其他 Telegram 账号，禁止换绑",
         )
 
-    final_stem = settings.account_sessions_root / f"user_{user.id}" / "telegram"
+    final_stem = account_session_stem(settings.account_sessions_root, user.id)
     final_stem.parent.mkdir(parents=True, exist_ok=True)
-    source = Path(attempt.candidate_session_path).with_suffix(".session")
+    source = candidate_session_stem(
+        settings.account_sessions_root,
+        attempt.user_id,
+        attempt.candidate_session_key,
+    ).with_suffix(".session")
     destination = final_stem.with_suffix(".session")
     if not source.exists():
         raise HTTPException(status_code=500, detail="Telegram session 文件未生成")
@@ -261,7 +289,6 @@ async def finalize_binding(
             username=getattr(me, "username", None),
             display_name=display_name,
             phone_masked=mask_phone(attempt.phone),
-            session_path=str(final_stem.resolve()),
             status="active",
         )
         db.add(account)
@@ -269,7 +296,6 @@ async def finalize_binding(
         account.username = getattr(me, "username", None)
         account.display_name = display_name
         account.phone_masked = mask_phone(attempt.phone)
-        account.session_path = str(final_stem.resolve())
         account.status = "active"
         account.last_checked_at = datetime.now(timezone.utc)
     await db.delete(attempt)

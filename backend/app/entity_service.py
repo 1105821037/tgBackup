@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import errors, functions, types, utils
 
@@ -28,12 +28,22 @@ from .models import (
     TelegramEntityRefreshJob,
     TelegramEntityVersion,
 )
-from .profile_crypto import decrypt_profile_value, encrypt_profile_value
 from .realtime import realtime_hub
 
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+ENTITY_REFRESH_KIND_RANK = {"photo": 0, "profile": 1}
+
+
+def entity_refresh_worker_count(value: int) -> int:
+    """Keep hydration parallelism useful without overwhelming one Telegram session."""
+    return max(1, min(value, 8))
+
+
+def entity_refresh_job_pause_seconds(value: float) -> float:
+    """Guarantee that maintenance work yields measurable time to web requests."""
+    return max(0.01, float(value))
 
 
 @dataclass(slots=True)
@@ -261,14 +271,9 @@ async def discover_entity(
     profile["about"] = about
 
     incoming_phone = getattr(entity_object, "phone", None)
-    old_phone = decrypt_profile_value(existing.phone_ciphertext) if existing else None
-    if incoming_phone is None and (is_min or existing):
+    old_phone = existing.phone if existing else None
+    if incoming_phone is None and existing:
         incoming_phone = old_phone
-    encrypted_phone = (
-        encrypt_profile_value(incoming_phone)
-        if incoming_phone != old_phone or existing is None
-        else existing.phone_ciphertext
-    )
 
     snapshot = {
         key: profile.get(key)
@@ -313,7 +318,7 @@ async def discover_entity(
             username=basic["username"],
             first_name=basic["first_name"],
             last_name=basic["last_name"],
-            phone_ciphertext=encrypted_phone,
+            phone=incoming_phone,
             about=about,
             photo_id=basic["photo_id"],
             is_contact=bool(getattr(entity_object, "contact", False)),
@@ -338,7 +343,7 @@ async def discover_entity(
             version=1,
             profile_hash=digest,
             snapshot_json=snapshot,
-            phone_ciphertext=encrypted_phone,
+            phone=incoming_phone,
             source=source,
             observed_at=now,
         )
@@ -356,7 +361,7 @@ async def discover_entity(
                 version=next_version,
                 profile_hash=digest,
                 snapshot_json=snapshot,
-                phone_ciphertext=encrypted_phone,
+                phone=incoming_phone,
                 source=source,
                 observed_at=now,
             )
@@ -369,7 +374,7 @@ async def discover_entity(
         existing.username = profile["username"]
         existing.first_name = profile["first_name"]
         existing.last_name = profile["last_name"]
-        existing.phone_ciphertext = encrypted_phone
+        existing.phone = incoming_phone
         existing.about = about
         existing.photo_id = profile["photo_id"]
         if not is_min:
@@ -532,6 +537,18 @@ async def discover_message_sender(
         source=source,
         priority=priority,
     )
+
+
+def require_message_sender_link(
+    message: Any,
+    entity: TelegramEntity | None,
+    entity_version_id: int | None,
+) -> None:
+    """Prevent messages with a Telegram sender from losing entity history."""
+    if getattr(message, "sender_id", None) is not None and (
+        entity is None or entity_version_id is None
+    ):
+        raise RuntimeError("消息发送者实体关联未建立")
 
 
 async def discover_message_forward_sender(
@@ -752,11 +769,11 @@ async def download_avatar_variant(
 
 class EntityRefreshCoordinator:
     def __init__(self) -> None:
-        self._task: asyncio.Task[None] | None = None
+        self._tasks: list[asyncio.Task[None]] = []
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
-        if self._task and not self._task.done():
+        if any(not task.done() for task in self._tasks):
             return
         now = utcnow()
         async with SessionLocal.begin() as db:
@@ -772,29 +789,46 @@ class EntityRefreshCoordinator:
                 .values(status="pending", lease_until=None)
             )
         self._stop.clear()
-        self._task = asyncio.create_task(
-            self._loop(), name="tg-entity-refresh-coordinator"
+        worker_count = entity_refresh_worker_count(
+            settings.telegram_entity_worker_concurrency
         )
+        # Keep one lane moving profile hydration while the remaining workers
+        # drain visible avatar work. General lanes automatically help profiles
+        # as soon as the avatar backlog is empty.
+        self._tasks = [
+            asyncio.create_task(
+                self._loop("profile" if worker_count > 1 and index == 0 else None),
+                name=f"tg-entity-refresh-worker-{index + 1}",
+            )
+            for index in range(worker_count)
+        ]
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks = []
 
-    async def _loop(self) -> None:
+    async def _loop(self, refresh_kind: str | None = None) -> None:
         while not self._stop.is_set():
             try:
-                worked = await self.tick()
+                worked = await self.tick(refresh_kind)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Telegram entity refresh tick failed")
                 worked = False
             if worked:
-                # Keep profile hydration deliberately below message backup priority.
-                await asyncio.sleep(1)
+                # Entity hydration is background maintenance. A small pacing
+                # delay prevents a large queue from monopolising the event
+                # loop and database pool while keeping avatar progress quick.
+                await asyncio.sleep(
+                    entity_refresh_job_pause_seconds(
+                        settings.telegram_entity_job_pause_seconds
+                    )
+                )
                 continue
             try:
                 await asyncio.wait_for(
@@ -804,7 +838,7 @@ class EntityRefreshCoordinator:
             except TimeoutError:
                 pass
 
-    async def claim_job(self) -> int | None:
+    async def claim_job(self, refresh_kind: str | None = None) -> int | None:
         now = utcnow()
         busy_accounts = select(ChatBackupRule.telegram_account_id).join(
             ChatBackupState, ChatBackupState.rule_id == ChatBackupRule.id
@@ -824,6 +858,11 @@ class EntityRefreshCoordinator:
                     TelegramAccount.status == "active",
                     TelegramEntity.telegram_account_id.not_in(busy_accounts),
                     TelegramEntity.telegram_account_id.not_in(history_busy_accounts),
+                    *(
+                        [TelegramEntityRefreshJob.refresh_kind == refresh_kind]
+                        if refresh_kind
+                        else []
+                    ),
                     or_(
                         and_(
                             TelegramEntityRefreshJob.status.in_(["pending", "error"]),
@@ -836,6 +875,14 @@ class EntityRefreshCoordinator:
                     ),
                 )
                 .order_by(
+                    # A current avatar is visible throughout the UI. Always
+                    # drain one-shot photo work before recurring profile work,
+                    # regardless of the discovery source's numeric priority.
+                    case(
+                        ENTITY_REFRESH_KIND_RANK,
+                        value=TelegramEntityRefreshJob.refresh_kind,
+                        else_=2,
+                    ),
                     TelegramEntityRefreshJob.priority.desc(),
                     TelegramEntityRefreshJob.next_run_at,
                 )
@@ -853,8 +900,12 @@ class EntityRefreshCoordinator:
             job.last_error = None
             return job.id
 
-    async def tick(self) -> bool:
-        job_id = await self.claim_job()
+    async def tick(self, refresh_kind: str | None = None) -> bool:
+        job_id = await self.claim_job(refresh_kind)
+        if job_id is None and refresh_kind is not None:
+            # A dedicated profile lane lends its capacity to the general queue
+            # when no profile is due, so idle capacity still drains avatars.
+            job_id = await self.claim_job()
         if job_id is None:
             return False
         try:
@@ -932,7 +983,6 @@ class EntityRefreshCoordinator:
                             source="photo_refresh",
                             priority=job.priority,
                         )
-                assets: list[dict[str, Any]] = []
                 if entity.photo_id:
                     for variant in ("small", "big"):
                         asset = await self.existing_photo(entity, variant)
@@ -945,49 +995,59 @@ class EntityRefreshCoordinator:
                                 variant,
                             )
                             if downloaded:
-                                assets.append(downloaded)
+                                await self.persist_photo_asset(
+                                    entity.id, entity.photo_id, downloaded
+                                )
+                                await realtime_hub.publish(
+                                    account.user_id,
+                                    "telegram.entity.avatar.updated",
+                                    {
+                                        "entity_id": entity.id,
+                                        "peer_id": entity.peer_id,
+                                        "photo_id": entity.photo_id,
+                                        "variants": [variant],
+                                    },
+                                )
             now = utcnow()
             async with SessionLocal.begin() as db:
                 stored = await db.get(TelegramEntity, entity.id)
                 if stored:
                     stored.last_photo_checked_at = now
-                for item in assets:
-                    asset = await db.scalar(
-                        select(TelegramEntityPhoto).where(
-                            TelegramEntityPhoto.entity_id == entity.id,
-                            TelegramEntityPhoto.telegram_photo_id == entity.photo_id,
-                            TelegramEntityPhoto.variant == item["variant"],
-                        )
-                    )
-                    if asset is None:
-                        asset = TelegramEntityPhoto(
-                            entity_id=entity.id,
-                            telegram_photo_id=entity.photo_id,
-                            variant=item["variant"],
-                            first_observed_at=now,
-                        )
-                        db.add(asset)
-                    asset.relative_path = item["relative_path"]
-                    asset.size_bytes = item["size_bytes"]
-                    asset.sha256 = item["sha256"]
-                    asset.mime_type = "image/jpeg"
-                    asset.status = "available"
-                    asset.last_observed_at = now
             await self.complete_job(job_id, recurring=False)
-            if assets:
-                await realtime_hub.publish(
-                    account.user_id,
-                    "telegram.entity.avatar.updated",
-                    {
-                        "entity_id": entity.id,
-                        "peer_id": entity.peer_id,
-                        "photo_id": entity.photo_id,
-                        "variants": [item["variant"] for item in assets],
-                    },
-                )
             return
 
         await self.complete_job(job_id, recurring=False)
+
+    async def persist_photo_asset(
+        self,
+        entity_id: int,
+        telegram_photo_id: int,
+        item: dict[str, Any],
+    ) -> None:
+        """Expose the small avatar immediately instead of waiting for the big copy."""
+        now = utcnow()
+        async with SessionLocal.begin() as db:
+            asset = await db.scalar(
+                select(TelegramEntityPhoto).where(
+                    TelegramEntityPhoto.entity_id == entity_id,
+                    TelegramEntityPhoto.telegram_photo_id == telegram_photo_id,
+                    TelegramEntityPhoto.variant == item["variant"],
+                )
+            )
+            if asset is None:
+                asset = TelegramEntityPhoto(
+                    entity_id=entity_id,
+                    telegram_photo_id=telegram_photo_id,
+                    variant=item["variant"],
+                    first_observed_at=now,
+                )
+                db.add(asset)
+            asset.relative_path = item["relative_path"]
+            asset.size_bytes = item["size_bytes"]
+            asset.sha256 = item["sha256"]
+            asset.mime_type = "image/jpeg"
+            asset.status = "available"
+            asset.last_observed_at = now
 
     async def existing_photo(
         self, entity: TelegramEntity, variant: str

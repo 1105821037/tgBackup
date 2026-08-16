@@ -11,8 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from telethon.requestiter import RequestIter
+
 
 logger = logging.getLogger(__name__)
+
+
+async def _close_download_stream(stream: Any) -> None:
+    if isinstance(stream, RequestIter) and not hasattr(stream, "_sender"):
+        return
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if asyncio.iscoroutine(result):
+        await result
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +44,7 @@ class DownloadPart:
 class ParallelDownloadResult:
     path: str
     sha256: str
-    connections: int
+    streams: int
 
 
 def _parts_for(
@@ -63,6 +76,14 @@ def _parts_for(
 
 def _manifest_path(temporary: Path) -> Path:
     return temporary.with_name(f"{temporary.name}.parallel.json")
+
+
+def discard_parallel_download(temporary: Path) -> None:
+    """Remove shards before falling back to the ordinary single stream."""
+    for stale in temporary.parent.glob(f"{temporary.name}.chunk-*"):
+        stale.unlink(missing_ok=True)
+    _manifest_path(temporary).unlink(missing_ok=True)
+    temporary.with_name(f"{temporary.name}.assembling").unlink(missing_ok=True)
 
 
 def _prepare_parts(
@@ -141,11 +162,7 @@ async def _download_part(
                     on_activity()
             handle.flush()
     finally:
-        close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
-        if close:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
+        await _close_download_stream(stream)
 
     if received != part.size:
         raise IOError(
@@ -171,7 +188,8 @@ def _assemble_parts(temporary: Path, parts: Sequence[DownloadPart]) -> tuple[str
 
 
 async def parallel_download_file(
-    clients: Sequence[Any],
+    client: Any,
+    stream_count: int,
     source: Any,
     file_size: int,
     temporary: Path,
@@ -180,28 +198,33 @@ async def parallel_download_file(
     request_size: int = 512 * 1024,
     on_activity: Callable[[], None] | None = None,
 ) -> ParallelDownloadResult:
-    """Download contiguous ranges over independent Telegram connections.
+    """Download contiguous ranges through concurrent streams on one client.
 
-    Each connection owns an append-only shard, so an interrupted download can
+    Each stream owns an append-only shard, so an interrupted download can
     resume without trusting a sparse file or replaying completed ranges.
     """
     if file_size <= 0:
         raise ValueError("并行下载需要已知文件大小")
-    if len(clients) < 2:
-        raise ValueError("并行下载至少需要两个独立连接")
+    if stream_count < 2:
+        raise ValueError("并发下载至少需要两个请求流")
     if request_size <= 0 or request_size % 4096:
         raise ValueError("Telegram 下载分片必须是 4096 字节的整数倍")
 
     temporary.parent.mkdir(parents=True, exist_ok=True)
-    parts = _prepare_parts(temporary, file_size, len(clients), request_size)
+    parts = _prepare_parts(temporary, file_size, stream_count, request_size)
+    resumed_bytes = sum(
+        min(part.path.stat().st_size, part.size) if part.path.exists() else 0
+        for part in parts
+    )
     started = time.monotonic()
     logger.info(
-        "Downloading Telegram media size=%s with %s connections",
+        "Downloading Telegram media size=%s with %s concurrent streams resumed=%s",
         file_size,
         len(parts),
+        resumed_bytes,
     )
     tasks = [asyncio.create_task(_download_part(
-            clients[part.index],
+            client,
             source,
             file_size,
             part,
@@ -219,11 +242,13 @@ async def parallel_download_file(
         raise
     path, sha256 = await asyncio.to_thread(_assemble_parts, temporary, parts)
     elapsed = max(time.monotonic() - started, 0.001)
+    transferred_bytes = max(file_size - resumed_bytes, 0)
     logger.info(
-        "Downloaded Telegram media size=%s connections=%s elapsed=%.2fs speed=%.2f MiB/s",
+        "Downloaded Telegram media size=%s concurrent_streams=%s elapsed=%.2fs "
+        "speed=%.2f MiB/s",
         file_size,
         len(parts),
         elapsed,
-        file_size / 1024 / 1024 / elapsed,
+        transferred_bytes / 1024 / 1024 / elapsed,
     )
-    return ParallelDownloadResult(path=path, sha256=sha256, connections=len(parts))
+    return ParallelDownloadResult(path=path, sha256=sha256, streams=len(parts))

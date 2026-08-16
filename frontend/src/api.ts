@@ -154,6 +154,13 @@ export interface ChatBackupRule {
   updated_at?: string
 }
 
+export interface CronPreview {
+  valid: boolean
+  expression: string
+  timezone: string
+  runs: string[]
+}
+
 export interface TelegramChat {
   peer_id: number
   is_self: boolean
@@ -253,6 +260,8 @@ export interface BackupRuleItem {
   history_update: {
     enabled: boolean
     status: string
+    has_remaining?: boolean
+    next_run_at?: string | null
     last_completed_at?: string | null
     latest_run?: {
       id: number
@@ -263,6 +272,7 @@ export interface BackupRuleItem {
       deleted_count: number
       media_completed_count: number
       error_count: number
+      has_remaining?: boolean
     } | null
   }
 }
@@ -291,7 +301,10 @@ export interface ArchiveMessageMedia {
   mime_type?: string | null
   name?: string | null
   size_bytes: number
+  width?: number | null
+  height?: number | null
   url: string
+  preview_url?: string | null
   download_url: string
 }
 
@@ -300,12 +313,18 @@ export interface ArchiveSharedMediaItem extends ArchiveMessageMedia {
   sent_at?: string | null
   text?: string | null
   content: Record<string, any>
+  version?: number
+  current_version?: number
+  is_history_version?: boolean
 }
 
 export interface ArchiveSharedMediaPage {
   items: ArchiveSharedMediaItem[]
+  total_count?: number
   has_more: boolean
   next_before_id?: number | null
+  next_before_version?: number | null
+  next_before_media_id?: number | null
 }
 
 export interface ArchiveMessage {
@@ -377,6 +396,8 @@ export interface ArchiveMessage {
   is_deleted: boolean
   is_edited: boolean
   current_version: number
+  displayed_version: number
+  is_restored: boolean
   edit_date?: string | null
   observed_at: string
   metrics: {
@@ -391,14 +412,30 @@ export interface ArchiveMessage {
 
 export interface ArchiveMessagePage {
   items: ArchiveMessage[]
-  has_more: boolean
-  has_older?: boolean
-  has_newer?: boolean
+  has_older: boolean
+  has_newer: boolean
   next_before_id?: number | null
   next_after_id?: number | null
   requested_anchor_id?: number | null
   anchor_id?: number | null
   anchor_found?: boolean | null
+}
+
+export interface ArchiveMessageSearchItem {
+  message_id: number
+  sent_at?: string | null
+  sender_name?: string | null
+  text?: string | null
+  matched_version: number
+  current_version: number
+  is_history_version: boolean
+}
+
+export interface ArchiveMessageSearchPage {
+  items: ArchiveMessageSearchItem[]
+  total_count: number
+  offset: number
+  has_more: boolean
 }
 
 export interface ArchiveMessageVersion {

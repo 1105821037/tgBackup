@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     mysql_user: str
     mysql_password: str
     mysql_database: str = "tg_backup"
+    database_pool_size: int = 15
+    database_max_overflow: int = 10
+    database_pool_timeout_seconds: int = 10
+    slow_request_log_seconds: float = 0.5
 
     telegram_api_id: int
     telegram_api_hash: str
@@ -43,7 +47,7 @@ class Settings(BaseSettings):
     backup_stage_timeout_seconds: int = 75
     # A media transfer fails only after this many seconds without byte progress.
     backup_media_timeout_seconds: int = 60
-    # Large files are split over independent, read-only Telegram connections.
+    # Concurrent range streams share the primary Telegram connection and auth key.
     telegram_media_parallel_connections_regular: int = 3
     telegram_media_parallel_connections_premium: int = 6
     telegram_media_parallel_threshold_bytes: int = 8 * 1024 * 1024
@@ -59,6 +63,16 @@ class Settings(BaseSettings):
     telegram_entity_profile_ttl_hours: int = 24
     telegram_entity_cold_profile_ttl_hours: int = 168
     telegram_entity_worker_lease_seconds: int = 300
+    telegram_entity_worker_concurrency: int = 3
+    telegram_entity_job_pause_seconds: float = 0.08
+    overview_cache_seconds: float = 10
+    ffmpeg_path: str = "ffmpeg"
+    media_preview_max_width: int = 640
+    media_preview_timeout_seconds: int = 20
+    media_preview_worker_count: int = 2
+    media_preview_queue_size: int = 256
+    custom_emoji_download_concurrency: int = 3
+    custom_emoji_download_timeout_seconds: int = 45
 
     @property
     def database_url(self) -> str:
@@ -88,12 +102,12 @@ class Settings(BaseSettings):
         return PROJECT_ROOT / "data" / "media"
 
     @property
-    def avatar_root(self) -> Path:
-        return PROJECT_ROOT / "data" / "avatars"
+    def media_preview_root(self) -> Path:
+        return PROJECT_ROOT / "data" / "previews"
 
     @property
-    def profile_key_path(self) -> Path:
-        return PROJECT_ROOT / "data" / "profile.key"
+    def avatar_root(self) -> Path:
+        return PROJECT_ROOT / "data" / "avatars"
 
     @property
     def frontend_dist(self) -> Path:

@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from .backup_scheduler import coordinator
 from .dependencies import Csrf, CurrentUser, Db
+from .history_update_service import history_sweep_progress
 from .models import (
     BackupRun,
     ChatBackupRule,
@@ -47,6 +48,7 @@ async def backup_status(user: CurrentUser, db: Db) -> dict[str, object]:
             .order_by(HistoryUpdateRun.started_at.desc())
             .limit(1)
         )
+        history_progress = await history_sweep_progress(db, history_state, latest_history)
         items.append(
             {
                 "peer_id": rule.peer_id,
@@ -88,25 +90,13 @@ async def backup_status(user: CurrentUser, db: Db) -> dict[str, object]:
                 "history_update": {
                     "enabled": rule.history_enabled,
                     "available": bool(state and state.last_completed_at),
-                    "status": history_state.status if history_state else "idle",
+                    "status": history_progress["status"] if history_progress else (history_state.status if history_state else "idle"),
+                    "has_remaining": history_progress["has_remaining"] if history_progress else False,
                     "next_run_at": history_state.next_run_at if history_state else None,
                     "last_completed_at": (
                         history_state.last_completed_at if history_state else None
                     ),
-                    "latest_run": (
-                        {
-                            "id": latest_history.id,
-                            "status": latest_history.status,
-                            "candidate_count": latest_history.candidate_count,
-                            "checked_count": latest_history.checked_count,
-                            "changed_count": latest_history.changed_count,
-                            "deleted_count": latest_history.deleted_count,
-                            "media_completed_count": latest_history.media_completed_count,
-                            "error_count": latest_history.error_count,
-                        }
-                        if latest_history
-                        else None
-                    ),
+                    "latest_run": history_progress,
                 },
             }
         )

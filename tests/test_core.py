@@ -1,7 +1,9 @@
 import asyncio
 import gc
 import hashlib
+from contextlib import asynccontextmanager
 from datetime import datetime, time, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,29 +11,58 @@ from pydantic import ValidationError
 
 from backend.app.config import get_settings
 from backend.app.chat_identity import SAVED_MESSAGES_TITLE, chat_display_title
-from backend.app.backup_scheduler import due_history_schedule_key, due_schedule_key
+import backend.app.backup_scheduler as backup_scheduler
+from backend.app.backup_scheduler import (
+    BackupCoordinator,
+    due_history_schedule_key,
+    due_schedule_key,
+)
 from backend.app.backup_service import (
     await_with_hard_timeout,
     classify_exception,
+    close_download_stream,
     content_hash,
     detect_media_type,
     download_media_with_stall_timeout,
     message_metadata,
     forward_metadata,
+    should_use_concurrent_media_download,
+    telegram_stream_expected_size,
 )
-from backend.app.models import ChatBackupRule
+from backend.app.models import (
+    ChatBackupRule,
+    MessageVersion,
+    TelegramEntity,
+    TelegramEntityVersion,
+)
+from backend.app.history_update_service import summarize_history_sweep
 from backend.app.origin_utils import is_allowed_browser_origin
 from backend.app.message_content import serialize_message_content
-from backend.app.media_downloader import _prepare_parts, parallel_download_file
+from backend.app.media_downloader import (
+    _prepare_parts,
+    discard_parallel_download,
+    parallel_download_file,
+)
+import backend.app.media_preview as media_preview
+import backend.app.routes_archive as routes_archive
+import backend.app.routes_entities as routes_entities
 from backend.app.realtime import RealtimeHub
-from backend.app.entity_service import basic_profile, raw_telegram_id, stable_hash
+from backend.app.entity_service import (
+    basic_profile,
+    raw_telegram_id,
+    require_message_sender_link,
+    stable_hash,
+)
 from backend.app.entity_service import discover_message_via_bot
 from backend.app.routes_entities import avatar_url
 from backend.app.routes_overview import empty_overview
+import backend.app.routes_overview as routes_overview
 from backend.app.routes_archive import (
     custom_emoji_locks,
     custom_emoji_extension,
+    display_versions,
     forward_origin_peer_id,
+    is_server_restricted_placeholder,
     message_entities_payload,
     serialized_peer_id,
     SHARED_MEDIA_TYPES,
@@ -41,13 +72,218 @@ from backend.app.routes_archive import (
 from backend.app.schemas import AdminUserUpdate, ChatBackupRuleInput, Credentials, PasswordChange, TelegramPhoneRequest
 from backend.app.security import SlidingWindowRateLimiter, hash_password, verify_password
 from backend.app.telegram_auth import mask_phone
-from backend.app.telegram_runtime import media_connection_limit
+from backend.app.telegram_runtime import (
+    account_session_stem,
+    candidate_session_stem,
+    media_stream_limit,
+)
 from telethon import types
+from telethon.requestiter import RequestIter
 
 
 def test_custom_emoji_file_extensions_are_stable() -> None:
     assert custom_emoji_extension("application/x-tgsticker") == ".tgs"
     assert custom_emoji_extension("video/webm") == ".webm"
+
+
+@pytest.mark.asyncio
+async def test_cached_custom_emoji_releases_db_before_file_response(monkeypatch, tmp_path) -> None:
+    account = routes_archive.AuthorizedTelegramAccount(user_id=7, account_id=11)
+
+    async def fake_authorized_account(_db, _token):
+        return account
+
+    class FakeDb:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    cached = tmp_path / "user_7" / "custom_emoji" / "123.webp"
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(b"emoji")
+    fake_db = FakeDb()
+    monkeypatch.setattr(routes_archive, "authorized_telegram_account", fake_authorized_account)
+    monkeypatch.setattr(
+        routes_archive,
+        "settings",
+        SimpleNamespace(
+            media_root=tmp_path,
+            custom_emoji_download_concurrency=3,
+            custom_emoji_download_timeout_seconds=45,
+        ),
+    )
+    response = await routes_archive.archive_custom_emoji(123, fake_db, "session")
+    assert fake_db.closed
+    assert Path(response.path) == cached
+
+
+@pytest.mark.asyncio
+async def test_custom_emoji_downloads_are_globally_bounded(monkeypatch, tmp_path) -> None:
+    account = routes_archive.AuthorizedTelegramAccount(user_id=7, account_id=11)
+    active = 0
+    max_active = 0
+
+    async def fake_authorized_account(_db, _token):
+        return account
+
+    class FakeDb:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    class FakeClient:
+        async def __call__(self, _request):
+            return [SimpleNamespace(mime_type="image/webp")]
+
+        async def download_media(self, _document, file):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(.02)
+                Path(file).write_bytes(b"emoji")
+                return file
+            finally:
+                active -= 1
+
+    class FakeRuntime:
+        @asynccontextmanager
+        async def client(self, _account_id):
+            yield FakeClient()
+
+    databases = [FakeDb() for _ in range(5)]
+    monkeypatch.setattr(routes_archive, "authorized_telegram_account", fake_authorized_account)
+    monkeypatch.setattr(routes_archive, "runtime_manager", FakeRuntime())
+    monkeypatch.setattr(routes_archive, "custom_emoji_slots", asyncio.Semaphore(2))
+    monkeypatch.setattr(
+        routes_archive,
+        "settings",
+        SimpleNamespace(
+            media_root=tmp_path,
+            custom_emoji_download_concurrency=2,
+            custom_emoji_download_timeout_seconds=1,
+        ),
+    )
+    responses = await asyncio.gather(*(
+        routes_archive.archive_custom_emoji(200 + index, db, "session")
+        for index, db in enumerate(databases)
+    ))
+    assert max_active == 2
+    assert all(db.closed for db in databases)
+    assert all(Path(response.path).is_file() for response in responses)
+    assert not list(tmp_path.rglob("*.part*"))
+
+
+@pytest.mark.asyncio
+async def test_avatar_releases_db_before_file_response(monkeypatch, tmp_path) -> None:
+    cached = tmp_path / "avatar.jpg"
+    cached.write_bytes(b"avatar")
+
+    async def fake_authorized_avatar(_db, _entity_id, _photo_id, _variant, _token):
+        return routes_entities.AuthorizedAvatar(
+            relative_path="avatar.jpg",
+            mime_type="image/jpeg",
+            sha256="abc",
+        )
+
+    class FakeDb:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    fake_db = FakeDb()
+    monkeypatch.setattr(routes_entities, "authorized_avatar", fake_authorized_avatar)
+    monkeypatch.setattr(routes_entities, "settings", SimpleNamespace(avatar_root=tmp_path))
+    response = await routes_entities.entity_avatar(1, 2, "small", fake_db, "session")
+    assert fake_db.closed
+    assert Path(response.path) == cached
+
+
+def test_history_sweep_progress_accumulates_continuation_runs() -> None:
+    first = SimpleNamespace(
+        id=1, status="success", candidate_count=1590, checked_count=1000,
+        changed_count=2, deleted_count=1, media_completed_count=3, error_count=0,
+    )
+    second = SimpleNamespace(
+        id=2, status="running", candidate_count=590, checked_count=200,
+        changed_count=1, deleted_count=0, media_completed_count=2, error_count=0,
+    )
+    state = SimpleNamespace(status="running", next_run_at=object())
+    progress = summarize_history_sweep([first, second], state)
+    assert progress == {
+        "id": 2,
+        "status": "running",
+        "candidate_count": 1590,
+        "checked_count": 1200,
+        "changed_count": 3,
+        "deleted_count": 1,
+        "media_completed_count": 5,
+        "error_count": 0,
+        "has_remaining": True,
+    }
+
+
+def test_history_sweep_progress_marks_waiting_continuation() -> None:
+    run = SimpleNamespace(
+        id=1, status="success", candidate_count=1590, checked_count=1000,
+        changed_count=0, deleted_count=0, media_completed_count=0, error_count=0,
+    )
+    state = SimpleNamespace(status="idle", next_run_at=object())
+    progress = summarize_history_sweep([run], state)
+    assert progress["status"] == "continuing"
+    assert progress["has_remaining"] is True
+
+
+def restricted_message_version(version: int = 2) -> MessageVersion:
+    return MessageVersion(
+        archived_message_id=68,
+        version=version,
+        content_hash="a" * 64,
+        text="This channel can’t be displayed because it violated Telegram's Terms of Service.",
+        content_kind="text",
+        content_json={},
+        is_deleted=False,
+        metadata_json={},
+    )
+
+
+def test_telegram_restriction_notice_is_detected_conservatively() -> None:
+    assert is_server_restricted_placeholder(restricted_message_version())
+    bot_notice = restricted_message_version()
+    bot_notice.text = "This bot can’t be displayed because it violated Telegram's Terms of Service."
+    assert is_server_restricted_placeholder(bot_notice)
+    ordinary = restricted_message_version()
+    ordinary.text = "This channel can't be displayed while the demo is loading."
+    assert not is_server_restricted_placeholder(ordinary)
+
+
+@pytest.mark.asyncio
+async def test_restricted_current_version_falls_back_to_latest_normal_snapshot() -> None:
+    normal = MessageVersion(
+        archived_message_id=68,
+        version=1,
+        content_hash="b" * 64,
+        text=None,
+        content_kind="video",
+        content_json={},
+        is_deleted=False,
+        metadata_json={"media_type": "video"},
+    )
+
+    class Scalars:
+        def all(self):
+            return [restricted_message_version(), normal]
+
+    class Db:
+        async def scalars(self, _statement):
+            return Scalars()
+
+    archived = SimpleNamespace(id=68)
+    selected = await display_versions(Db(), [(archived, restricted_message_version())])
+    assert selected[68] is normal
     assert custom_emoji_extension("image/webp") == ".webp"
     assert custom_emoji_extension("application/octet-stream") == ".bin"
 
@@ -131,6 +367,27 @@ def test_empty_overview_has_stable_zero_state() -> None:
     assert payload["activities"] == []
 
 
+@pytest.mark.asyncio
+async def test_overview_cache_coalesces_repeated_page_loads(monkeypatch) -> None:
+    routes_overview.clear_overview_cache()
+    calls = 0
+
+    async def fake_build(_user, _db):
+        nonlocal calls
+        calls += 1
+        return {"message_count": calls}
+
+    monkeypatch.setattr(routes_overview, "build_overview", fake_build)
+    monkeypatch.setattr(routes_overview.settings, "overview_cache_seconds", 10)
+    user = SimpleNamespace(id=987654)
+    first = await routes_overview.overview(user, object())
+    second = await routes_overview.overview(user, object())
+
+    assert first == second == {"message_count": 1}
+    assert calls == 1
+    routes_overview.clear_overview_cache(user.id)
+
+
 def test_phone_requires_international_format() -> None:
     with pytest.raises(ValidationError):
         TelegramPhoneRequest(phone="13800000000")
@@ -160,24 +417,135 @@ def test_browser_origin_accepts_current_host_and_rejects_foreign_hosts() -> None
     )
 
 
-def test_media_connection_limit_uses_premium_tier(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = get_settings()
-    monkeypatch.setattr(settings, "telegram_media_parallel_connections_regular", 3)
-    monkeypatch.setattr(settings, "telegram_media_parallel_connections_premium", 6)
-    assert media_connection_limit(False) == 3
-    assert media_connection_limit(True) == 6
+def test_media_stream_limit_uses_premium_tier() -> None:
+    assert media_stream_limit(False) == 3
+    assert media_stream_limit(True) == 6
 
 
-def test_media_connection_limit_has_safe_bounds(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_media_stream_limit_has_safe_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = get_settings()
     monkeypatch.setattr(settings, "telegram_media_parallel_connections_regular", 0)
     monkeypatch.setattr(settings, "telegram_media_parallel_connections_premium", 20)
-    assert media_connection_limit(False) == 1
-    assert media_connection_limit(True) == 6
+
+    assert media_stream_limit(False) == 1
+    assert media_stream_limit(True) == 6
+
+
+def test_existing_serial_media_part_is_not_restarted_as_concurrent(tmp_path) -> None:
+    temporary = tmp_path / "video.mp4.part"
+    threshold = get_settings().telegram_media_parallel_threshold_bytes
+
+    assert should_use_concurrent_media_download(1, threshold, temporary)
+    temporary.write_bytes(b"partial")
+    assert not should_use_concurrent_media_download(1, threshold, temporary)
+
+
+def test_account_session_path_is_derived_from_current_project(tmp_path) -> None:
+    assert account_session_stem(tmp_path / "accounts", 7) == (
+        tmp_path / "accounts" / "user_7" / "telegram"
+    ).resolve()
+
+
+def test_candidate_session_key_is_resolved_below_pending_directory(tmp_path) -> None:
+    key = "user_7_0123456789abcdef0123456789abcdef"
+    assert candidate_session_stem(tmp_path / "accounts", 7, key) == (
+        tmp_path / "accounts" / "pending" / key
+    ).resolve()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "../telegram",
+        "pending/user_7_0123456789abcdef0123456789abcdef",
+        "user_8_0123456789abcdef0123456789abcdef",
+        "user_7_not-a-uuid",
+    ],
+)
+def test_candidate_session_key_rejects_unsafe_or_foreign_values(
+    tmp_path, key
+) -> None:
+    with pytest.raises(ValueError):
+        candidate_session_stem(tmp_path / "accounts", 7, key)
+
+
+@pytest.mark.asyncio
+async def test_background_preview_is_deduplicated(monkeypatch, tmp_path) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_preview(source, target, **_kwargs):
+        started.set()
+        await release.wait()
+        return target
+
+    monkeypatch.setattr(media_preview, "ensure_media_preview", fake_preview)
+    source = tmp_path / "source.mp4"
+    target = tmp_path / "preview.jpg"
+    source.write_bytes(b"video")
+    await media_preview.start_media_preview_workers(worker_count=1, queue_size=1)
+    try:
+        assert media_preview.schedule_media_preview(source, target, media_type="video")
+        assert not media_preview.schedule_media_preview(source, target, media_type="video")
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        assert media_preview.preview_queue is not None
+        await asyncio.wait_for(media_preview.preview_queue.join(), timeout=1)
+        assert str(target) not in media_preview.scheduled_preview_targets
+    finally:
+        release.set()
+        await media_preview.stop_media_preview_workers()
+
+
+@pytest.mark.asyncio
+async def test_background_preview_queue_is_bounded(monkeypatch, tmp_path) -> None:
+    release = asyncio.Event()
+
+    async def fake_preview(source, target, **_kwargs):
+        await release.wait()
+        return target
+
+    monkeypatch.setattr(media_preview, "ensure_media_preview", fake_preview)
+    await media_preview.start_media_preview_workers(worker_count=1, queue_size=1)
+    try:
+        first = tmp_path / "first.jpg"
+        second = tmp_path / "second.jpg"
+        assert media_preview.schedule_media_preview(tmp_path / "first.mp4", first, media_type="video")
+        # No event-loop turn has allowed the worker to drain the queue yet.
+        assert not media_preview.schedule_media_preview(tmp_path / "second.mp4", second, media_type="video")
+        assert str(second) not in media_preview.scheduled_preview_targets
+    finally:
+        release.set()
+        await media_preview.stop_media_preview_workers()
+
+
+@pytest.mark.asyncio
+async def test_backup_coordinator_waits_for_pipeline_cleanup(monkeypatch) -> None:
+    started = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def pending_backup(*_args, **_kwargs) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # Give the cancellation path a scheduling point so the test catches
+            # a coordinator that cancels the pipeline without joining it.
+            await asyncio.sleep(0)
+            cleaned_up.set()
+
+    monkeypatch.setattr(backup_scheduler, "backup_rule", pending_backup)
+    test_coordinator = BackupCoordinator()
+    assert test_coordinator.launch(7, "manual")
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await asyncio.wait_for(test_coordinator.stop(), timeout=1)
+
+    assert cleaned_up.is_set()
+    assert not any(
+        task.get_name() == "tg-backup-pipeline-7" and not task.done()
+        for task in asyncio.all_tasks()
+    )
 
 
 def test_weekly_rule_requires_and_normalizes_weekdays() -> None:
@@ -248,6 +616,20 @@ def test_cron_schedule_claims_only_the_matching_minute() -> None:
     assert due_history_schedule_key(rule, history_time) == "2026-08-10@03:30"
 
 
+def test_cron_preview_uses_strict_scheduler_rules() -> None:
+    from backend.app.schedule_utils import next_cron_runs
+
+    base = datetime(2026, 8, 16, 13, 42)
+    assert next_cron_runs("0 */1 * * ?", base) == [
+        datetime(2026, 8, 16, 14, 0),
+        datetime(2026, 8, 16, 15, 0),
+        datetime(2026, 8, 16, 16, 0),
+        datetime(2026, 8, 16, 17, 0),
+        datetime(2026, 8, 16, 18, 0),
+    ]
+    assert next_cron_runs("0 9 * * * extra", base) == []
+
+
 def test_pipeline_metadata_hash_and_failure_classification() -> None:
     message = SimpleNamespace(
         photo=SimpleNamespace(id=7),
@@ -266,6 +648,44 @@ def test_pipeline_metadata_hash_and_failure_classification() -> None:
     failure = classify_exception(OSError("offline"))
     assert failure.code == "network_error"
     assert failure.action == "retry"
+    assert "offline" in failure.detail
+
+
+def test_webpage_embedded_media_is_not_treated_as_downloadable() -> None:
+    embedded_photo = SimpleNamespace(id=123)
+    message = SimpleNamespace(
+        media=types.MessageMediaWebPage(
+            webpage=types.WebPagePending(id=99, date=datetime.now(timezone.utc))
+        ),
+        photo=embedded_photo,
+        document=None,
+    )
+
+    assert detect_media_type(message) is None
+    metadata = message_metadata(message, None)
+    assert metadata["media_type"] is None
+    assert metadata["media_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_uninitialized_telethon_download_stream_does_not_mask_error() -> None:
+    class FailedDownloadIter(RequestIter):
+        async def _init(self, **kwargs):
+            raise OSError("original download failure")
+
+        async def _load_next_chunk(self):
+            return True
+
+        async def close(self):
+            if not self._sender:
+                return
+
+    stream = FailedDownloadIter(SimpleNamespace(), limit=1)
+    with pytest.raises(OSError, match="original download failure"):
+        try:
+            await stream.__anext__()
+        finally:
+            await close_download_stream(stream)
 
 
 def test_forward_metadata_keeps_saved_messages_origin() -> None:
@@ -577,6 +997,20 @@ def test_telegram_entity_identity_and_stable_hash() -> None:
     assert avatar_url(8, 99, "small") == "/api/entities/8/avatar/99/small"
 
 
+def test_entity_phone_fields_use_the_expected_schema() -> None:
+    assert "phone" in TelegramEntity.__table__.columns
+    assert "phone" in TelegramEntityVersion.__table__.columns
+
+
+def test_messages_with_sender_ids_require_entity_history_links() -> None:
+    message = SimpleNamespace(sender_id=7)
+    entity = SimpleNamespace(id=11)
+    require_message_sender_link(message, entity, 13)
+    with pytest.raises(RuntimeError, match="发送者实体关联"):
+        require_message_sender_link(message, None, None)
+    require_message_sender_link(SimpleNamespace(sender_id=None), None, None)
+
+
 def test_self_dialog_uses_saved_messages_title() -> None:
     assert chat_display_title(42, 42, "Smith") == SAVED_MESSAGES_TITLE
     assert chat_display_title(42, 99, "Morty") == "Morty"
@@ -720,11 +1154,61 @@ async def test_media_download_resumes_an_existing_partial_file(tmp_path) -> None
     assert partial.read_bytes() == b"abcdef"
 
 
+def test_photo_stream_size_matches_telethon_selected_variant() -> None:
+    message = SimpleNamespace(
+        file=SimpleNamespace(size=3024),
+        photo=SimpleNamespace(sizes=[
+            types.PhotoSize(type="m", w=320, h=299, size=3024),
+            types.PhotoSizeProgressive(
+                type="x", w=348, h=325, sizes=[1178, 2786, 2800]
+            ),
+        ]),
+    )
+    assert telegram_stream_expected_size(message) == 2800
+
+
 @pytest.mark.asyncio
-async def test_parallel_media_download_uses_independent_ranges(tmp_path) -> None:
+async def test_completed_progressive_photo_partial_is_accepted(tmp_path) -> None:
+    partial = tmp_path / "progressive.jpg.part"
+    partial.write_bytes(b"x" * 2800)
+    message = SimpleNamespace(
+        file=SimpleNamespace(size=3024),
+        media=object(),
+        photo=SimpleNamespace(sizes=[
+            types.PhotoSize(type="m", w=320, h=299, size=3024),
+            types.PhotoSizeProgressive(
+                type="x", w=348, h=325, sizes=[1178, 2786, 2800]
+            ),
+        ]),
+    )
+
+    class CompletePhotoClient:
+        consumed = False
+
+        async def _chunks(self):
+            self.consumed = True
+            yield b"unexpected"
+
+        def iter_download(self, source, *, offset, file_size):
+            assert source is message.media
+            assert offset == 2800
+            assert file_size == 2800
+            return self._chunks()
+
+    client = CompletePhotoClient()
+    result = await download_media_with_stall_timeout(client, message, partial)
+    assert result == str(partial)
+    assert client.consumed is False
+
+
+@pytest.mark.asyncio
+async def test_parallel_media_download_uses_one_client_for_concurrent_ranges(tmp_path) -> None:
     payload = bytes(range(251)) * 300
     request_size = 4096
     calls: list[tuple[int, int]] = []
+
+    active = 0
+    max_active = 0
 
     class RangeClient:
         def iter_download(
@@ -733,19 +1217,28 @@ async def test_parallel_media_download_uses_independent_ranges(tmp_path) -> None
             calls.append((offset, limit))
 
             async def chunks():
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
                 cursor = offset
-                for _ in range(limit):
-                    if cursor >= file_size:
-                        break
-                    data = payload[cursor : min(cursor + request_size, file_size)]
-                    cursor += len(data)
-                    yield data
+                try:
+                    for _ in range(limit):
+                        if cursor >= file_size:
+                            break
+                        await asyncio.sleep(0)
+                        data = payload[cursor : min(cursor + request_size, file_size)]
+                        cursor += len(data)
+                        yield data
+                finally:
+                    active -= 1
 
             return chunks()
 
     temporary = tmp_path / "parallel.part"
+    client = RangeClient()
     result = await parallel_download_file(
-        [RangeClient(), RangeClient(), RangeClient()],
+        client,
+        3,
         object(),
         len(payload),
         temporary,
@@ -755,7 +1248,8 @@ async def test_parallel_media_download_uses_independent_ranges(tmp_path) -> None
 
     assert temporary.read_bytes() == payload
     assert result.sha256 == hashlib.sha256(payload).hexdigest()
-    assert result.connections == 3
+    assert result.streams == 3
+    assert max_active == 3
     assert len(calls) == 3
     assert sorted(offset for offset, _ in calls)[0] == 0
     assert not list(tmp_path.glob("*.chunk-*"))
@@ -790,7 +1284,8 @@ async def test_parallel_media_download_resumes_each_shard(tmp_path) -> None:
             return chunks()
 
     await parallel_download_file(
-        [RangeClient(), RangeClient()],
+        RangeClient(),
+        2,
         object(),
         len(payload),
         temporary,
@@ -800,3 +1295,17 @@ async def test_parallel_media_download_resumes_each_shard(tmp_path) -> None:
 
     assert temporary.read_bytes() == payload
     assert parts[0].start + first_completed in offsets
+
+
+def test_parallel_download_shards_can_be_discarded_for_serial_fallback(tmp_path) -> None:
+    temporary = tmp_path / "fallback.part"
+    parts = _prepare_parts(temporary, 16384, 2, 4096)
+    for part in parts:
+        part.path.write_bytes(b"partial")
+    temporary.with_name(f"{temporary.name}.assembling").write_bytes(b"partial")
+
+    discard_parallel_download(temporary)
+
+    assert not list(tmp_path.glob("*.chunk-*"))
+    assert not list(tmp_path.glob("*.parallel.json"))
+    assert not list(tmp_path.glob("*.assembling"))

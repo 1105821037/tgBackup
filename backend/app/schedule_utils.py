@@ -14,6 +14,20 @@ def is_valid_five_field_cron(value: str) -> bool:
     return len(expression.split()) == 5 and croniter.is_valid(expression, strict=True)
 
 
+def next_cron_runs(
+    value: str,
+    now: datetime,
+    count: int = 5,
+) -> list[datetime]:
+    """Return upcoming run times using the scheduler's five-field Cron rules."""
+    expression = normalize_cron(value)
+    if not is_valid_five_field_cron(expression):
+        return []
+    base = now.replace(second=0, microsecond=0)
+    iterator = croniter(expression, base, ret_type=datetime)
+    return [iterator.get_next(datetime) for _ in range(count)]
+
+
 def due_schedule_slot(
     schedule_kind: str,
     scheduled_time: time,

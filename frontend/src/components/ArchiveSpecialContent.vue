@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { serverDate } from '../utils/dateTime'
 
 const props = defineProps<{
   kind: 'game' | 'invoice' | 'story' | 'paid_media' | 'giveaway' | 'giveaway_results'
@@ -22,7 +23,7 @@ function formatTelegramAmount(amount: unknown, currency: unknown) {
 
 function formatDate(value: unknown) {
   if (!value) return '时间未知'
-  const date = new Date(String(value))
+  const date = serverDate(String(value))
   if (Number.isNaN(date.getTime())) return '时间未知'
   return new Intl.DateTimeFormat('zh-CN', {
     year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit',

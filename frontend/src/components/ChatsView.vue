@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api, type ChatBackupRule, type TelegramChat, type TelegramEntityDetail } from '../api'
 import type { RealtimeEvent } from '../realtime'
+import { serverDate } from '../utils/dateTime'
 import HistoryRangeFields from './HistoryRangeFields.vue'
 import SavedMessagesIcon from './SavedMessagesIcon.vue'
 import ScheduleFields from './ScheduleFields.vue'
@@ -132,14 +133,18 @@ function handleRealtimeEvent(event: Event) {
 
 function formatDate(value?: string | null) {
   if (!value) return '暂无消息'
-  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(new Date(value))
+  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(serverDate(value))
+}
+
+function formatMessageCount(value: number) {
+  return Math.max(0, Math.trunc(value)).toLocaleString('zh-CN')
 }
 
 function formatTimestamp(value?: string | null) {
   if (!value) return '尚未完成'
   return new Intl.DateTimeFormat('zh-CN', {
     year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  }).format(new Date(value))
+  }).format(serverDate(value))
 }
 
 async function loadEntityDetail(chat: TelegramChat) {
@@ -296,7 +301,7 @@ onBeforeUnmount(() => {
     <section class="chats-heading">
       <div>
         <p class="eyebrow">会话管理</p>
-        <h1>选择需要守护的对话。</h1>
+        <h1>选择需要备份的对话。</h1>
         <p class="muted">{{ chats.length }} 个会话 · {{ configuredCount }} 个已配置</p>
       </div>
       <button class="button secondary compact" :disabled="refreshing" @click="loadChats(true)">
@@ -352,7 +357,7 @@ onBeforeUnmount(() => {
         </span>
         <span class="chat-meta">
           <span>{{ formatDate(chat.last_message_date) }}</span>
-          <span v-if="chat.unread_count" class="unread">{{ Math.min(chat.unread_count, 99) }}</span>
+          <span v-if="chat.unread_count" class="unread">{{ formatMessageCount(chat.unread_count) }}</span>
         </span>
         <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
       </button>
@@ -437,7 +442,7 @@ onBeforeUnmount(() => {
               <div class="setting-row">
                 <div>
                   <strong>历史消息更新</strong>
-                  <span v-if="form.history_available">检测编辑与删除，并补全已选择的媒体</span>
+                  <span v-if="form.history_available">检查已入库的消息是否更新</span>
                   <span v-else>完成首次自动备份后可开启</span>
                 </div>
                 <button

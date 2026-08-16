@@ -71,7 +71,6 @@ class TelegramAccount(Base):
     username: Mapped[str | None] = mapped_column(String(64))
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone_masked: Mapped[str | None] = mapped_column(String(32))
-    session_path: Mapped[str] = mapped_column(String(512), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     bound_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -88,7 +87,7 @@ class TelegramLoginAttempt(Base):
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False
     )
-    candidate_session_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    candidate_session_key: Mapped[str] = mapped_column(String(64), nullable=False)
     phone: Mapped[str] = mapped_column(String(32), nullable=False)
     phone_code_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     stage: Mapped[str] = mapped_column(String(32), nullable=False, default="code_sent")
@@ -113,7 +112,7 @@ class TelegramEntity(Base):
     username: Mapped[str | None] = mapped_column(String(64))
     first_name: Mapped[str | None] = mapped_column(String(255))
     last_name: Mapped[str | None] = mapped_column(String(255))
-    phone_ciphertext: Mapped[str | None] = mapped_column(Text)
+    phone: Mapped[str | None] = mapped_column(String(32))
     about: Mapped[str | None] = mapped_column(Text)
     photo_id: Mapped[int | None] = mapped_column(BigInteger)
     is_contact: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -172,7 +171,7 @@ class TelegramEntityVersion(Base):
     version: Mapped[int] = mapped_column(nullable=False)
     profile_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     snapshot_json: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
-    phone_ciphertext: Mapped[str | None] = mapped_column(Text)
+    phone: Mapped[str | None] = mapped_column(String(32))
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -479,7 +478,6 @@ class ArchivedMessage(Base):
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    content_hash_schema: Mapped[int] = mapped_column(nullable=False, default=3)
     current_version: Mapped[int] = mapped_column(nullable=False, default=1)
     history_update_count: Mapped[int] = mapped_column(nullable=False, default=0)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

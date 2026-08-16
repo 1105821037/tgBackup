@@ -1,26 +1,90 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Cookie, HTTPException, Query
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import and_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .dependencies import CurrentUser, Db
+from .security import SESSION_COOKIE, digest
 from .models import (
     TelegramAccount,
     TelegramEntity,
     TelegramEntityMetricDaily,
     TelegramEntityPhoto,
     TelegramEntityVersion,
+    WebSession,
 )
-from .profile_crypto import decrypt_profile_value
 from .telegram_auth import mask_phone
 
 
 router = APIRouter(prefix="/api/entities", tags=["entities"])
 settings = get_settings()
+
+
+@dataclass(frozen=True)
+class AuthorizedAvatar:
+    relative_path: str
+    mime_type: str | None
+    sha256: str
+
+
+async def authorized_avatar(
+    db: AsyncSession,
+    entity_id: int,
+    photo_id: int,
+    variant: str,
+    session_token: str | None,
+) -> AuthorizedAvatar:
+    """Resolve an owned avatar with one short database checkout."""
+    if not session_token:
+        raise HTTPException(status_code=401, detail="请先登录")
+    row = (
+        await db.execute(
+            select(WebSession.id, TelegramEntityPhoto, TelegramAccount.id)
+            .select_from(WebSession)
+            .outerjoin(
+                TelegramEntityPhoto,
+                and_(
+                    TelegramEntityPhoto.entity_id == entity_id,
+                    TelegramEntityPhoto.telegram_photo_id == photo_id,
+                    TelegramEntityPhoto.variant == variant,
+                    TelegramEntityPhoto.status == "available",
+                ),
+            )
+            .outerjoin(
+                TelegramEntity,
+                TelegramEntity.id == TelegramEntityPhoto.entity_id,
+            )
+            .outerjoin(
+                TelegramAccount,
+                and_(
+                    TelegramAccount.id == TelegramEntity.telegram_account_id,
+                    TelegramAccount.user_id == WebSession.user_id,
+                ),
+            )
+            .where(
+                WebSession.token_hash == digest(session_token),
+                WebSession.expires_at > datetime.now(timezone.utc),
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="登录已过期")
+    _, photo, owner_account_id = row
+    if photo is None or owner_account_id is None:
+        raise HTTPException(status_code=404, detail="头像不存在")
+    return AuthorizedAvatar(
+        relative_path=photo.relative_path,
+        mime_type=photo.mime_type,
+        sha256=photo.sha256,
+    )
 
 
 async def owned_entity(
@@ -78,7 +142,6 @@ async def entity_detail(
             .limit(30)
         )
     ).all()
-    phone = decrypt_profile_value(entity.phone_ciphertext)
     return {
         "id": entity.id,
         "peer_id": entity.peer_id,
@@ -88,7 +151,7 @@ async def entity_detail(
         "username": entity.username,
         "first_name": entity.first_name,
         "last_name": entity.last_name,
-        "phone_masked": mask_phone(phone) if phone else None,
+        "phone_masked": mask_phone(entity.phone) if entity.phone else None,
         "about": entity.about,
         "is_contact": entity.is_contact,
         "is_verified": entity.is_verified,
@@ -131,22 +194,13 @@ async def entity_avatar(
     entity_id: int,
     photo_id: int,
     variant: str,
-    user: CurrentUser,
     db: Db,
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
 ) -> FileResponse:
     if variant not in {"small", "big"}:
         raise HTTPException(status_code=404, detail="头像规格不存在")
-    entity = await owned_entity(db, user.id, entity_id)
-    photo = await db.scalar(
-        select(TelegramEntityPhoto).where(
-            TelegramEntityPhoto.entity_id == entity.id,
-            TelegramEntityPhoto.telegram_photo_id == photo_id,
-            TelegramEntityPhoto.variant == variant,
-            TelegramEntityPhoto.status == "available",
-        )
-    )
-    if photo is None:
-        raise HTTPException(status_code=404, detail="头像不存在")
+    photo = await authorized_avatar(db, entity_id, photo_id, variant, session_token)
+    await db.close()
     root = settings.avatar_root.resolve()
     path = (root / photo.relative_path).resolve()
     try:

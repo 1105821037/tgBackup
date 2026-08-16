@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+from time import monotonic
+
 from fastapi import APIRouter
 from sqlalchemy import case, func, select
 
 from .chat_identity import chat_display_title
+from .config import get_settings
 from .dependencies import CurrentUser, Db
 from .models import (
     ArchivedMessage,
@@ -19,6 +23,9 @@ from .models import (
 
 
 router = APIRouter(prefix="/api/overview", tags=["overview"])
+settings = get_settings()
+overview_cache: dict[int, tuple[float, dict[str, object]]] = {}
+overview_cache_locks: dict[int, asyncio.Lock] = {}
 
 
 def empty_overview() -> dict[str, object]:
@@ -38,8 +45,7 @@ def empty_overview() -> dict[str, object]:
     }
 
 
-@router.get("")
-async def overview(user: CurrentUser, db: Db) -> dict[str, object]:
+async def build_overview(user: CurrentUser, db: Db) -> dict[str, object]:
     account = await db.scalar(
         select(TelegramAccount).where(TelegramAccount.user_id == user.id)
     )
@@ -199,3 +205,30 @@ async def overview(user: CurrentUser, db: Db) -> dict[str, object]:
         "last_completed_at": max(completed_times) if completed_times else None,
         "activities": activities[:6],
     }
+
+
+def clear_overview_cache(user_id: int | None = None) -> None:
+    if user_id is None:
+        overview_cache.clear()
+        return
+    overview_cache.pop(user_id, None)
+
+
+@router.get("")
+async def overview(user: CurrentUser, db: Db) -> dict[str, object]:
+    ttl = max(0.0, settings.overview_cache_seconds)
+    cached = overview_cache.get(user.id)
+    now = monotonic()
+    if cached and now - cached[0] < ttl:
+        return cached[1]
+
+    lock = overview_cache_locks.setdefault(user.id, asyncio.Lock())
+    async with lock:
+        cached = overview_cache.get(user.id)
+        now = monotonic()
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        payload = await build_overview(user, db)
+        if ttl > 0:
+            overview_cache[user.id] = (monotonic(), payload)
+        return payload

@@ -8,13 +8,29 @@ import OverviewView from './OverviewView.vue'
 import RulesView from './RulesView.vue'
 import UserManagement from './UserManagement.vue'
 
+type DashboardPage = 'overview' | 'chats' | 'rules' | 'archive' | 'account'
+
+const dashboardPages = new Set<DashboardPage>(['overview', 'chats', 'rules', 'archive', 'account'])
+
+function pageFromLocation(): DashboardPage {
+  const page = window.location.hash.replace(/^#\/?/, '').split(/[/?]/, 1)[0]
+  return dashboardPages.has(page as DashboardPage) ? page as DashboardPage : 'overview'
+}
+
+function locationHasDashboardPage() {
+  const page = window.location.hash.replace(/^#\/?/, '').split(/[/?]/, 1)[0]
+  return dashboardPages.has(page as DashboardPage)
+}
+
 const props = defineProps<{ user: UserInfo }>()
 const emit = defineEmits<{ logout: [] }>()
+const appVersion = __APP_VERSION__
 const loggingOut = ref(false)
-const activePage = ref<'overview' | 'chats' | 'rules' | 'archive' | 'account'>('overview')
-// Keep an explicit user preference separate from the temporary compact layout
-// used when entering the message archive. The old key also recorded automatic
-// collapses, so a new key avoids treating that leaked state as user intent.
+const activePage = ref<DashboardPage>(pageFromLocation())
+const archiveMobileDetailOpen = ref(false)
+let applyingBrowserRoute = false
+// Keep the user's sidebar preference separate from the temporary compact
+// layout used while the message archive is open.
 const userSidebarCollapsed = ref(window.localStorage.getItem('tg-backup-sidebar-user-collapsed') === 'true')
 const archiveAutoCollapsed = ref(false)
 const sidebarCollapsed = computed(() => userSidebarCollapsed.value || archiveAutoCollapsed.value)
@@ -43,14 +59,26 @@ watch(activePage, (page, previousPage) => {
     archiveAutoCollapsed.value = !userSidebarCollapsed.value
   } else if (previousPage === 'archive' && page !== 'archive') {
     archiveAutoCollapsed.value = false
+    archiveMobileDetailOpen.value = false
+  }
+
+  const targetHash = `#/${page}`
+  if (!applyingBrowserRoute && window.location.hash !== targetHash) {
+    window.history.pushState(null, '', targetHash)
   }
 })
 
+function syncPageFromLocation() {
+  applyingBrowserRoute = true
+  activePage.value = pageFromLocation()
+  applyingBrowserRoute = false
+}
+
 const realtimeLabel = computed(() => ({
-  connected: '实时同步已连接',
+  connected: '已连接',
   connecting: '正在建立实时同步',
-  reconnecting: '实时同步重连中',
-  disconnected: '实时同步未连接',
+  reconnecting: '重连中',
+  disconnected: '未连接',
 }[realtimeState.value]))
 
 function onRealtimeState(event: Event) {
@@ -106,11 +134,19 @@ async function refreshAccountAvatar() {
 }
 
 onMounted(() => {
+  const canonicalHash = `#/${activePage.value}`
+  if (!locationHasDashboardPage()) {
+    window.history.replaceState(null, '', canonicalHash)
+  }
+  window.addEventListener('popstate', syncPageFromLocation)
+  window.addEventListener('hashchange', syncPageFromLocation)
   window.addEventListener('tg-realtime-state', onRealtimeState)
   window.addEventListener('tg-realtime-event', onRealtimeEvent)
   refreshAccountAvatar()
 })
 onUnmounted(() => {
+  window.removeEventListener('popstate', syncPageFromLocation)
+  window.removeEventListener('hashchange', syncPageFromLocation)
   window.removeEventListener('tg-realtime-state', onRealtimeState)
   window.removeEventListener('tg-realtime-event', onRealtimeEvent)
 })
@@ -127,12 +163,10 @@ async function logout() {
 </script>
 
 <template>
-  <div :class="['dashboard-shell', { 'archive-mode': activePage === 'archive', 'sidebar-collapsed': sidebarCollapsed }]">
+  <div :class="['dashboard-shell', { 'archive-mode': activePage === 'archive', 'archive-mobile-detail-open': activePage === 'archive' && archiveMobileDetailOpen, 'sidebar-collapsed': sidebarCollapsed }]">
     <aside class="sidebar" aria-label="主导航">
       <div class="sidebar-brand">
-        <span class="brand-mark tiny" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M20.5 4.5 3.8 10.9c-1.1.4-1.1 1.1-.2 1.4l4.3 1.3 1.7 5.2c.2.6.1.8.8.8.5 0 .8-.2 1-.4l2.1-2 4.4 3.2c.8.5 1.4.2 1.6-.8l2.9-13.7c.3-1.2-.5-1.8-1.9-1.4Z" /></svg>
-        </span>
+        <img class="brand-mark tiny" src="/app-icon.png" alt="" aria-hidden="true" />
         <span>tgBackup</span>
       </div>
       <button
@@ -164,9 +198,12 @@ async function logout() {
         </button>
       </nav>
 
-      <div class="sidebar-foot" aria-live="polite">
-        <span :class="['status-dot', realtimeState]"></span>
-        <span>{{ realtimeLabel }}</span>
+      <div class="sidebar-meta">
+        <div class="sidebar-foot" aria-live="polite">
+          <span :class="['status-dot', realtimeState]"></span>
+          <span>{{ realtimeLabel }}</span>
+        </div>
+        <div class="sidebar-version" :title="`tgBackup ${appVersion}`">v{{ appVersion }}</div>
       </div>
     </aside>
 
@@ -211,7 +248,7 @@ async function logout() {
 
       <ChatsView v-else-if="activePage === 'chats'" key="chats" @manage-rule="activePage = 'rules'" />
       <RulesView v-else-if="activePage === 'rules'" key="rules" @browse-chats="activePage = 'chats'" />
-      <ArchiveView v-else-if="activePage === 'archive'" key="archive" />
+      <ArchiveView v-else-if="activePage === 'archive'" key="archive" @mobile-detail-change="archiveMobileDetailOpen = $event" />
       <UserManagement
         v-else
         key="account"

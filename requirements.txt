@@ -1,4 +1,5 @@
 telethon==1.44.0
+cryptg>=0.6,<1
 python-dotenv>=1.0,<2
 python-socks[asyncio]>=2.7,<3
 fastapi>=0.116,<1
@@ -10,5 +11,4 @@ pwdlib[argon2]>=0.2.1,<1
 pytest>=8.4,<9
 pytest-asyncio>=1.1,<2
 httpx>=0.28,<1
-cryptography>=50,<51
 croniter>=6.2.4,<7

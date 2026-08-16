@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { api, type ManagedUser, type UserInfo } from '../api'
+import { serverDate } from '../utils/dateTime'
 
 const props = defineProps<{ user: UserInfo; avatarUrl?: string | null }>()
 const emit = defineEmits<{ logout: [] }>()
@@ -30,7 +31,7 @@ const editSaving = ref(false)
 const editError = ref('')
 
 function formatDate(value: string) {
-  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'short', day: 'numeric' }).format(new Date(value))
+  return new Intl.DateTimeFormat('zh-CN', { year: 'numeric', month: 'short', day: 'numeric' }).format(serverDate(value))
 }
 
 async function changePassword() {

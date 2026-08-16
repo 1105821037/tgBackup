@@ -21,6 +21,9 @@ from dotenv import load_dotenv
 from telethon import TelegramClient
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
 def required_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -29,7 +32,7 @@ def required_env(name: str) -> str:
 
 
 def load_config() -> tuple[int, str, Path, dict[str, object] | None]:
-    load_dotenv()
+    load_dotenv(PROJECT_ROOT / ".env")
 
     try:
         api_id = int(required_env("TELEGRAM_API_ID"))
@@ -37,9 +40,7 @@ def load_config() -> tuple[int, str, Path, dict[str, object] | None]:
         raise SystemExit("TELEGRAM_API_ID 必须是整数") from exc
 
     api_hash = required_env("TELEGRAM_API_HASH")
-    session = Path(
-        os.getenv("TELEGRAM_SESSION", "data/sessions/probe_account").strip()
-    ).expanduser()
+    session = PROJECT_ROOT / "data" / "probes" / "telegram_probe"
     session.parent.mkdir(parents=True, exist_ok=True)
 
     proxy_type = os.getenv("TELEGRAM_PROXY_TYPE", "").strip().lower()
@@ -243,7 +244,7 @@ async def probe_chat(
             for requested_id, message in zip(lookup_ids, lookup)
         ]
 
-        probe_dir = Path("data/probes") / str(peer_id)
+        probe_dir = PROJECT_ROOT / "data" / "probes" / str(peer_id)
         probe_dir.mkdir(parents=True, exist_ok=True)
         downloaded: dict[str, Any] | None = None
         for message in newest_first:
@@ -383,7 +384,7 @@ async def probe_channel_capabilities(dialog_limit: int) -> None:
             "dialogs_examined_at_most": dialog_limit,
             "channel_samples": [selected] if selected else [],
         }
-        output = Path("data/probes/channel_capabilities.json")
+        output = PROJECT_ROOT / "data" / "probes" / "channel_capabilities.json"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(report, ensure_ascii=False, indent=2))

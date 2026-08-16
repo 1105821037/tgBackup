@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from typing import Any, Callable
 
 from sqlalchemy import select
 from telethon import errors, types
+from telethon.requestiter import RequestIter
 
 from .config import get_settings
 from .db import SessionLocal
@@ -21,6 +23,7 @@ from .entity_service import (
     discover_message_forward_sender,
     discover_message_sender,
     discover_message_via_bot,
+    require_message_sender_link,
 )
 from .models import (
     ArchivedMessage,
@@ -34,7 +37,8 @@ from .models import (
     TelegramAccount,
 )
 from .message_content import serialize_message_content
-from .media_downloader import parallel_download_file
+from .media_downloader import discard_parallel_download, parallel_download_file
+from .media_preview import preview_cache_path, schedule_media_preview, supports_preview
 from .realtime import realtime_hub
 from .telegram_runtime import (
     TelegramAuthorizationError,
@@ -200,9 +204,11 @@ def classify_exception(exc: BaseException) -> PipelineFailure:
             "retry",
         )
     if isinstance(exc, (OSError, TimeoutError, ConnectionError)):
-        return PipelineFailure("network_error", name, "retry")
+        detail = f"{name}: {exc}" if str(exc) else name
+        return PipelineFailure("network_error", detail, "retry")
     if isinstance(exc, errors.RPCError):
-        return PipelineFailure("telegram_rpc_error", name, "retry")
+        detail = f"{name}: {exc}" if str(exc) else name
+        return PipelineFailure("telegram_rpc_error", detail, "retry")
     if isinstance(exc, PipelineFailure):
         return exc
     return PipelineFailure("unexpected_error", f"{name}: {exc}", "retry")
@@ -305,7 +311,11 @@ def inline_buttons_metadata(message: Any) -> list[list[dict[str, Any]]]:
 
 
 def message_metadata(message: Any, media_type: str | None) -> dict[str, Any]:
-    media = getattr(message, "photo", None) or getattr(message, "document", None)
+    media = (
+        getattr(message, "photo", None) or getattr(message, "document", None)
+        if media_type
+        else None
+    )
     content_kind, content = serialize_message_content(message, media_type)
     return {
         "out": bool(getattr(message, "out", False)),
@@ -343,6 +353,12 @@ def volatile_metadata(message: Any) -> dict[str, Any]:
 
 
 def detect_media_type(message: Any) -> str | None:
+    # Telethon exposes a WebPage's embedded photo/document through the custom
+    # Message.photo and Message.document convenience properties. The enclosing
+    # MessageMediaWebPage itself is not a downloadable InputFileLocation, so it
+    # must remain metadata-only even when the linked page has an image or video.
+    if isinstance(getattr(message, "media", None), types.MessageMediaWebPage):
+        return None
     if getattr(message, "photo", None):
         return "photo"
     document = getattr(message, "document", None)
@@ -403,12 +419,89 @@ def safe_extension(message: Any) -> str:
     return "".join(char for char in extension if char.isalnum() or char == ".")
 
 
+def telegram_stream_expected_size(message: Any) -> int:
+    """Match the exact photo variant selected by Telethon's iter_download.
+
+    ``message.file.size`` is the largest byte count across all photo sizes,
+    while ``iter_download(message.media)`` selects ``photo.sizes[-1]``. A
+    higher-resolution progressive photo can be smaller in bytes, so mixing the
+    two values produces a false incomplete-download error.
+    """
+    photo = getattr(message, "photo", None)
+    sizes = getattr(photo, "sizes", None) or []
+    if sizes:
+        selected = sizes[-1]
+        if isinstance(selected, types.PhotoSizeProgressive):
+            return max(selected.sizes, default=0)
+        if isinstance(selected, types.PhotoSize):
+            return int(selected.size or 0)
+        if isinstance(selected, types.PhotoCachedSize):
+            return len(selected.bytes or b"")
+        if isinstance(selected, types.PhotoStrippedSize):
+            payload = selected.bytes or b""
+            return len(payload) if len(payload) < 3 or payload[0] != 1 else len(payload) + 622
+        if isinstance(selected, types.PhotoSizeEmpty):
+            return 0
+    return int(getattr(getattr(message, "file", None), "size", 0) or 0)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def should_use_concurrent_media_download(
+    telegram_account_id: int | None,
+    expected_size: int,
+    temporary: Path,
+) -> bool:
+    """Use concurrent ranges only for new large downloads with no serial state."""
+    return (
+        telegram_account_id is not None
+        and expected_size >= settings.telegram_media_parallel_threshold_bytes
+        and not temporary.exists()
+    )
+
+
+async def close_download_stream(stream: Any) -> None:
+    """Close an initialized iterator without hiding an initialization error."""
+    if isinstance(stream, RequestIter) and not hasattr(stream, "_sender"):
+        return
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if close is None:
+        return
+    result = close()
+    if asyncio.iscoroutine(result):
+        await result
+
+
+async def download_media_concurrently(
+    client: Any,
+    stream_count: int,
+    source: Any,
+    expected_size: int,
+    temporary: Path,
+    on_activity: Callable[[], None] | None,
+):
+    """Download ranges as concurrent requests on the primary client."""
+    logger.info(
+        "Starting Telegram ranged media download streams=%s size=%s",
+        stream_count,
+        expected_size,
+    )
+    return await parallel_download_file(
+        client,
+        stream_count,
+        source,
+        expected_size,
+        temporary,
+        stall_timeout=settings.backup_media_timeout_seconds,
+        request_size=settings.telegram_media_request_size_bytes,
+        on_activity=on_activity,
+    )
 
 
 async def download_media(
@@ -436,26 +529,26 @@ async def download_media(
     downloaded_now = not target.exists()
     downloaded_sha256: str | None = None
     if downloaded_now:
-        expected_size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
-        use_parallel = (
-            telegram_account_id is not None
-            and expected_size >= settings.telegram_media_parallel_threshold_bytes
+        expected_size = telegram_stream_expected_size(message)
+        use_parallel = should_use_concurrent_media_download(
+            telegram_account_id,
+            expected_size,
+            temporary,
         )
         if use_parallel:
             try:
-                async with runtime_manager.media_download_clients(
+                async with runtime_manager.media_download_slot(
                     telegram_account_id,
                     timeout=settings.backup_fetch_timeout_seconds,
-                ) as media_clients:
-                    if len(media_clients) > 1:
-                        parallel_result = await parallel_download_file(
-                            media_clients,
+                ) as stream_count:
+                    if stream_count > 1:
+                        parallel_result = await download_media_concurrently(
+                            client,
+                            stream_count,
                             getattr(message, "media", None) or message,
                             expected_size,
                             temporary,
-                            stall_timeout=settings.backup_media_timeout_seconds,
-                            request_size=settings.telegram_media_request_size_bytes,
-                            on_activity=on_activity,
+                            on_activity,
                         )
                         downloaded = parallel_result.path
                         downloaded_sha256 = parallel_result.sha256
@@ -469,14 +562,59 @@ async def download_media(
             except (TelegramAuthorizationError, asyncio.CancelledError):
                 raise
             except BaseException as exc:
-                logger.warning(
-                    "Parallel media download failed for peer=%s message=%s; "
-                    "keeping shards for the next pipeline retry: %s",
-                    peer_id,
-                    getattr(message, "id", None),
-                    type(exc).__name__,
-                )
-                raise
+                error_name = type(exc).__name__
+                if error_name == "AuthKeyDuplicatedError":
+                    logger.warning(
+                        "Telegram invalidated a duplicated authorization key for "
+                        "account=%s peer=%s message=%s error=%s",
+                        telegram_account_id,
+                        peer_id,
+                        getattr(message, "id", None),
+                        error_name,
+                    )
+                    await runtime_manager.disable_parallel_media(telegram_account_id)
+                    discard_parallel_download(temporary)
+                    await runtime_manager.invalidate_account(
+                        telegram_account_id,
+                        error_name,
+                    )
+                    raise TelegramAuthorizationError(
+                        "Telegram Session 已失效，请重新登录"
+                    ) from exc
+                if error_name == "AuthBytesInvalidError":
+                    logger.warning(
+                        "Telegram rejected media authorization for account=%s peer=%s "
+                        "message=%s error=%s; disabling concurrent streams",
+                        telegram_account_id,
+                        peer_id,
+                        getattr(message, "id", None),
+                        error_name,
+                    )
+                    await runtime_manager.disable_parallel_media(telegram_account_id)
+                    discard_parallel_download(temporary)
+                    downloaded = await download_media_with_stall_timeout(
+                        client,
+                        message,
+                        temporary,
+                        on_activity=on_activity,
+                    )
+                else:
+                    logger.warning(
+                        "Parallel media download failed for peer=%s message=%s; "
+                        "disabling concurrent streams and falling back to a serial "
+                        "request stream: %s",
+                        peer_id,
+                        getattr(message, "id", None),
+                        error_name,
+                    )
+                    await runtime_manager.disable_parallel_media(telegram_account_id)
+                    discard_parallel_download(temporary)
+                    downloaded = await download_media_with_stall_timeout(
+                        client,
+                        message,
+                        temporary,
+                        on_activity=on_activity,
+                    )
         else:
             downloaded = await download_media_with_stall_timeout(
                 client,
@@ -521,12 +659,13 @@ async def download_media_with_stall_timeout(
     Keeping the partial file also avoids restarting a large transfer after a
     transient media-DC or proxy failure.
     """
-    file_info = getattr(message, "file", None)
-    expected_size = int(getattr(file_info, "size", 0) or 0)
+    expected_size = telegram_stream_expected_size(message)
     received = temporary.stat().st_size if temporary.exists() else 0
     if expected_size and received > expected_size:
         temporary.unlink()
         received = 0
+    initial_received = received
+    started = time.monotonic()
 
     source = getattr(message, "media", None) or message
     stream = client.iter_download(
@@ -559,19 +698,23 @@ async def download_media_with_stall_timeout(
                 if on_activity:
                     on_activity()
     finally:
-        close = (
-            getattr(stream, "close", None) or getattr(stream, "aclose", None)
-        ) if can_close_stream else None
-        if close:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
+        if can_close_stream:
+            await close_download_stream(stream)
 
     if expected_size and received != expected_size:
         raise PipelineFailure(
             "media_download_incomplete",
             f"媒体下载不完整（{received}/{expected_size} 字节）",
         )
+    elapsed = max(time.monotonic() - started, 0.001)
+    transferred_bytes = max(received - initial_received, 0)
+    logger.info(
+        "Downloaded Telegram media with primary stream transferred=%s elapsed=%.2fs "
+        "speed=%.2f MiB/s",
+        transferred_bytes,
+        elapsed,
+        transferred_bytes / 1024 / 1024 / elapsed,
+    )
     return str(temporary)
 
 
@@ -600,6 +743,7 @@ async def persist_message(
     metrics = volatile_metadata(message)
     digest = content_hash(message, metadata)
     now = utcnow()
+    preview_asset: tuple[int, DownloadedMedia] | None = None
 
     async with SessionLocal.begin() as db:
         sender_entity, sender_version_id = await discover_message_sender(
@@ -609,6 +753,7 @@ async def persist_message(
             source="message_backup",
             priority=90,
         )
+        require_message_sender_link(message, sender_entity, sender_version_id)
         await discover_message_forward_sender(
             db,
             account.id,
@@ -640,7 +785,6 @@ async def persist_message(
                 sender_entity_id=sender_entity.id if sender_entity else None,
                 sent_at=getattr(message, "date", None),
                 current_content_hash=digest,
-                content_hash_schema=3,
                 current_version=1,
                 is_deleted=False,
                 first_observed_at=now,
@@ -679,18 +823,19 @@ async def persist_message(
             archived.current_content_hash = digest
             archived.current_version = version_number
             if downloaded:
-                db.add(
-                    MediaAsset(
-                        message_version_id=version.id,
-                        media_type=downloaded.media_type,
-                        telegram_media_id=downloaded.telegram_media_id,
-                        relative_path=downloaded.relative_path,
-                        size_bytes=downloaded.size_bytes,
-                        sha256=downloaded.sha256,
-                        mime_type=downloaded.mime_type,
-                        original_name=downloaded.original_name,
-                    )
+                asset = MediaAsset(
+                    message_version_id=version.id,
+                    media_type=downloaded.media_type,
+                    telegram_media_id=downloaded.telegram_media_id,
+                    relative_path=downloaded.relative_path,
+                    size_bytes=downloaded.size_bytes,
+                    sha256=downloaded.sha256,
+                    mime_type=downloaded.mime_type,
+                    original_name=downloaded.original_name,
                 )
+                db.add(asset)
+                await db.flush()
+                preview_asset = (asset.id, downloaded)
         else:
             current_version = await db.scalar(
                 select(MessageVersion).where(
@@ -748,6 +893,19 @@ async def persist_message(
             run.stored_count += 1
         if downloaded and changed:
             run.media_count += 1
+    if preview_asset:
+        media_id, item = preview_asset
+        if supports_preview(item.media_type, item.mime_type):
+            source = (settings.media_root / item.relative_path).resolve()
+            target = preview_cache_path(settings.media_preview_root.resolve(), media_id, item.sha256)
+            schedule_media_preview(
+                source,
+                target,
+                media_type=item.media_type,
+                ffmpeg_path=settings.ffmpeg_path,
+                max_width=settings.media_preview_max_width,
+                timeout_seconds=settings.media_preview_timeout_seconds,
+            )
     return changed
 
 

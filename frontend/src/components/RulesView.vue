@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { api, type BackupRuleItem, type ChatBackupRule } from '../api'
 import type { RealtimeEvent } from '../realtime'
+import { serverDate } from '../utils/dateTime'
 import HistoryRangeFields from './HistoryRangeFields.vue'
 import SavedMessagesIcon from './SavedMessagesIcon.vue'
 import ScheduleFields from './ScheduleFields.vue'
@@ -52,7 +53,7 @@ const mediaTypeLabels: Record<string, string> = {
 }
 const historyStatusLabels: Record<string, string> = {
   idle: '等待更新', running: '正在更新', success: '更新完成', partial: '部分完成',
-  failed: '更新失败', error: '等待重试', paused: '已暂停', interrupted: '已中断',
+  continuing: '等待继续更新', failed: '更新失败', error: '等待重试', paused: '已暂停', interrupted: '已中断',
 }
 
 const form = reactive<ChatBackupRule>({
@@ -111,7 +112,7 @@ function formatTimestamp(value?: string | null) {
   if (!value) return '尚未完成'
   return new Intl.DateTimeFormat('zh-CN', {
     month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  }).format(new Date(value))
+  }).format(serverDate(value))
 }
 
 function formatBytes(value: number) {
@@ -305,11 +306,13 @@ function handleRealtimeEvent(event: Event) {
       deleted_count?: number
       media_completed_count?: number
       error_count?: number
+      has_remaining?: boolean
     }
     if (!payload.peer_id) return
     const item = rules.value.find((rule) => rule.peer_id === payload.peer_id)
     if (!item) return
     item.history_update.status = payload.status || item.history_update.status
+    item.history_update.has_remaining = payload.has_remaining ?? item.history_update.has_remaining
     item.history_update.latest_run = {
       id: payload.run_id || item.history_update.latest_run?.id || 0,
       status: payload.status || 'running',
@@ -319,6 +322,7 @@ function handleRealtimeEvent(event: Event) {
       deleted_count: payload.deleted_count || 0,
       media_completed_count: payload.media_completed_count || 0,
       error_count: payload.error_count || 0,
+      has_remaining: payload.has_remaining || false,
     }
     const running = new Set(historyRunningPeers.value)
     if (message.type === 'telegram.history.started' || message.type === 'telegram.history.progress') {
@@ -414,7 +418,7 @@ onBeforeUnmount(() => {
     <section class="chats-heading">
       <div>
         <p class="eyebrow">规则管理</p>
-        <h1>让每条备份计划清晰可见。</h1>
+        <h1>管理每条备份计划。</h1>
         <p class="muted">
           {{ rules.length }} 条规则 · {{ enabledCount }} 条已启用<template v-if="runningCount"> · {{ runningCount }} 条正在备份</template>
         </p>
@@ -457,7 +461,7 @@ onBeforeUnmount(() => {
         <section v-if="item.rule.history_enabled" class="history-progress-card">
           <div class="history-progress-head">
             <strong>历史消息更新</strong>
-            <span :class="['backup-status', item.history_update.status]"><i></i>{{ historyRunningPeers.has(item.peer_id) ? '正在更新' : historyStatusLabels[item.history_update.latest_run?.status || item.history_update.status] || '等待更新' }}</span>
+            <span :class="['backup-status', item.history_update.status]"><i></i>{{ historyRunningPeers.has(item.peer_id) ? '正在更新' : item.history_update.has_remaining ? '等待继续更新' : historyStatusLabels[item.history_update.latest_run?.status || item.history_update.status] || '等待更新' }}</span>
           </div>
           <div class="history-progress-track" role="progressbar" :aria-valuenow="item.history_update.latest_run?.checked_count || 0" :aria-valuemax="Math.max(item.history_update.latest_run?.candidate_count || 0, 1)">
             <span :style="{ width: `${historyPercent(item)}%` }"></span>
@@ -500,7 +504,7 @@ onBeforeUnmount(() => {
 
           <form class="config-form" @submit.prevent="saveRule">
             <section class="setting-group">
-              <div class="setting-row"><div><strong>启用自动备份</strong><span>关闭后保留规则、游标与已有数据</span></div><button type="button" class="switch" role="switch" :aria-checked="form.enabled" @click="form.enabled = !form.enabled"><span></span></button></div>
+              <div class="setting-row"><div><strong>启用自动备份</strong><span>关闭后保留规则、已有数据</span></div><button type="button" class="switch" role="switch" :aria-checked="form.enabled" @click="form.enabled = !form.enabled"><span></span></button></div>
             </section>
             <section class="setting-group"><ScheduleFields v-model:kind="form.schedule_kind" v-model:scheduled-time="form.backup_time" v-model:weekdays="form.weekdays" v-model:cron-expression="form.cron_expression" label="备份周期" /></section>
             <section class="setting-group">

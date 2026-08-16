@@ -12,15 +12,16 @@ export interface AlbumLayout {
 }
 
 const GAP = 2
-const MIN_TILE = 96
+const MIN_TILE = 100
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
 }
 
 function finish(width: number, tiles: AlbumTile[]): AlbumLayout {
+  const measuredWidth = Math.max(...tiles.map((tile) => tile.x + tile.width))
   return {
-    width,
+    width: Math.min(width, measuredWidth),
     height: Math.max(...tiles.map((tile) => tile.y + tile.height)),
     tiles,
   }
@@ -138,16 +139,20 @@ function partitions(count: number, average: number) {
   }
   if (result.length) return result
 
-  const rowCount = Math.max(5, Math.ceil((count - 4) / 3) + 1)
-  const rows = Array.from({ length: rowCount }, () => 1)
-  let remaining = count - rowCount
-  for (let index = rowCount - 1; index >= 0 && remaining; index -= 1) {
-    const limit = index === rowCount - 1 ? 4 : 3
-    const added = Math.min(remaining, limit - 1)
-    rows[index] += added
-    remaining -= added
+  const minimumRows = Math.max(5, Math.ceil((count - 4) / 3) + 1)
+  const maximumRows = Math.min(count, minimumRows + 2)
+  for (let rowCount = minimumRows; rowCount <= maximumRows; rowCount += 1) {
+    const rows = Array.from({ length: rowCount }, () => 1)
+    let remaining = count - rowCount
+    for (let index = rowCount - 1; index >= 0 && remaining; index -= 1) {
+      const limit = index === rowCount - 1 ? 4 : 3
+      const added = Math.min(remaining, limit - 1)
+      rows[index] += added
+      remaining -= added
+    }
+    if (!remaining) result.push(rows)
   }
-  return remaining ? [] : [rows]
+  return result
 }
 
 function many(sourceRatios: number[], width: number): AlbumLayout {
@@ -195,8 +200,9 @@ export function calculateAlbumLayout(sourceRatios: number[], maxWidth: number): 
     const height = Math.round(Math.min(width / ratios[0], width))
     return finish(width, [{ x: 0, y: 0, width, height }])
   }
-  if (ratios.length === 2) return two(ratios, width)
-  if (ratios.length === 3) return three(ratios, width)
-  if (ratios.length === 4) return four(ratios, width)
+  const forceComplexLayout = ratios.some((ratio) => ratio > 2)
+  if (!forceComplexLayout && ratios.length === 2) return two(ratios, width)
+  if (!forceComplexLayout && ratios.length === 3) return three(ratios, width)
+  if (!forceComplexLayout && ratios.length === 4) return four(ratios, width)
   return many(ratios, width)
 }

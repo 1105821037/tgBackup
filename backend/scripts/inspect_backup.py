@@ -67,8 +67,8 @@ async def main() -> None:
         message_summary = (
             await connection.execute(
                 text(
-                    "SELECT COUNT(*) AS messages, SUM(content_hash_schema = 3) AS schema3, "
-                    "SUM(history_update_count) AS updates, SUM(is_deleted) AS deleted "
+                    "SELECT COUNT(*) AS messages, SUM(history_update_count) AS updates, "
+                    "SUM(is_deleted) AS deleted "
                     "FROM archived_messages"
                 )
             )

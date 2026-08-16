@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func, select
 
 from .chat_identity import chat_display_title
@@ -22,8 +22,10 @@ from .models import (
     TelegramEntity,
     TelegramEntityPhoto,
 )
+from .history_update_service import history_sweep_progress
 from .realtime import realtime_hub
 from .schemas import ChatBackupRuleInput
+from .schedule_utils import is_valid_five_field_cron, next_cron_runs, normalize_cron
 
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
@@ -64,70 +66,164 @@ async def list_rules(user: CurrentUser, db: Db) -> dict[str, object]:
             .order_by(ChatBackupRule.updated_at.desc())
         )
     ).all()
-    items: list[dict[str, object]] = []
-    for rule in rules:
-        message_count = await db.scalar(
-            select(func.count(ArchivedMessage.id)).where(
-                ArchivedMessage.telegram_account_id == rule.telegram_account_id,
-                ArchivedMessage.peer_id == rule.peer_id,
-            )
-        )
-        media_rows = (
+    if not rules:
+        return {"items": [], "count": 0}
+
+    rule_ids = [rule.id for rule in rules]
+    peer_ids = [rule.peer_id for rule in rules]
+    account_ids = {rule.telegram_account_id for rule in rules}
+    message_counts = {
+        (account_id, peer_id): count
+        for account_id, peer_id, count in (
             await db.execute(
-                select(MediaAsset.relative_path, MediaAsset.size_bytes)
-                .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
-                .join(
-                    ArchivedMessage,
-                    ArchivedMessage.id == MessageVersion.archived_message_id,
+                select(
+                    ArchivedMessage.telegram_account_id,
+                    ArchivedMessage.peer_id,
+                    func.count(ArchivedMessage.id),
                 )
                 .where(
-                    ArchivedMessage.telegram_account_id == rule.telegram_account_id,
-                    ArchivedMessage.peer_id == rule.peer_id,
+                    ArchivedMessage.telegram_account_id.in_(account_ids),
+                    ArchivedMessage.peer_id.in_(peer_ids),
+                )
+                .group_by(
+                    ArchivedMessage.telegram_account_id,
+                    ArchivedMessage.peer_id,
                 )
             )
         ).all()
-        unique_media = {relative_path: size_bytes for relative_path, size_bytes in media_rows}
-        state = await db.scalar(
-            select(ChatBackupState).where(ChatBackupState.rule_id == rule.id)
+    }
+    unique_media = (
+        select(
+            ArchivedMessage.telegram_account_id.label("account_id"),
+            ArchivedMessage.peer_id.label("peer_id"),
+            MediaAsset.relative_path.label("relative_path"),
+            func.max(MediaAsset.size_bytes).label("size_bytes"),
         )
-        latest = await db.scalar(
-            select(BackupRun)
-            .where(BackupRun.rule_id == rule.id)
-            .order_by(BackupRun.started_at.desc())
-            .limit(1)
+        .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
+        .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
+        .where(
+            ArchivedMessage.telegram_account_id.in_(account_ids),
+            ArchivedMessage.peer_id.in_(peer_ids),
         )
-        history_state = await db.scalar(
-            select(HistoryUpdateState).where(HistoryUpdateState.rule_id == rule.id)
+        .group_by(
+            ArchivedMessage.telegram_account_id,
+            ArchivedMessage.peer_id,
+            MediaAsset.relative_path,
         )
-        latest_history = await db.scalar(
-            select(HistoryUpdateRun)
-            .where(HistoryUpdateRun.rule_id == rule.id)
-            .order_by(HistoryUpdateRun.started_at.desc())
-            .limit(1)
-        )
-        dialog_row = (
+        .subquery()
+    )
+    media_stats = {
+        (account_id, peer_id): (count, size_bytes)
+        for account_id, peer_id, count, size_bytes in (
             await db.execute(
-                select(TelegramDialog, TelegramEntity)
-                .outerjoin(TelegramEntity, TelegramEntity.id == TelegramDialog.entity_id)
-                .where(
-                    TelegramDialog.telegram_account_id == rule.telegram_account_id,
-                    TelegramDialog.peer_id == rule.peer_id,
-                )
-                .limit(1)
+                select(
+                    unique_media.c.account_id,
+                    unique_media.c.peer_id,
+                    func.count(unique_media.c.relative_path),
+                    func.coalesce(func.sum(unique_media.c.size_bytes), 0),
+                ).group_by(unique_media.c.account_id, unique_media.c.peer_id)
             )
-        ).first()
-        dialog, entity = dialog_row if dialog_row else (None, None)
-        is_self = bool(account and rule.peer_id == account.telegram_user_id)
-        avatar_photo_id = None
-        if entity and entity.photo_id:
-            avatar_photo_id = await db.scalar(
-                select(TelegramEntityPhoto.telegram_photo_id).where(
-                    TelegramEntityPhoto.entity_id == entity.id,
-                    TelegramEntityPhoto.telegram_photo_id == entity.photo_id,
+        ).all()
+    }
+    states = {
+        state.rule_id: state
+        for state in (
+            await db.scalars(
+                select(ChatBackupState).where(ChatBackupState.rule_id.in_(rule_ids))
+            )
+        ).all()
+    }
+    history_states = {
+        state.rule_id: state
+        for state in (
+            await db.scalars(
+                select(HistoryUpdateState).where(HistoryUpdateState.rule_id.in_(rule_ids))
+            )
+        ).all()
+    }
+    latest_run_ids = (
+        select(BackupRun.rule_id, func.max(BackupRun.id).label("run_id"))
+        .where(BackupRun.rule_id.in_(rule_ids))
+        .group_by(BackupRun.rule_id)
+        .subquery()
+    )
+    latest_runs = {
+        run.rule_id: run
+        for run in (
+            await db.scalars(
+                select(BackupRun).join(
+                    latest_run_ids, latest_run_ids.c.run_id == BackupRun.id
+                )
+            )
+        ).all()
+    }
+    latest_history_ids = (
+        select(
+            HistoryUpdateRun.rule_id,
+            func.max(HistoryUpdateRun.id).label("run_id"),
+        )
+        .where(HistoryUpdateRun.rule_id.in_(rule_ids))
+        .group_by(HistoryUpdateRun.rule_id)
+        .subquery()
+    )
+    latest_history_runs = {
+        run.rule_id: run
+        for run in (
+            await db.scalars(
+                select(HistoryUpdateRun).join(
+                    latest_history_ids,
+                    latest_history_ids.c.run_id == HistoryUpdateRun.id,
+                )
+            )
+        ).all()
+    }
+    dialog_rows = (
+        await db.execute(
+            select(TelegramDialog, TelegramEntity)
+            .outerjoin(TelegramEntity, TelegramEntity.id == TelegramDialog.entity_id)
+            .where(
+                TelegramDialog.telegram_account_id.in_(account_ids),
+                TelegramDialog.peer_id.in_(peer_ids),
+            )
+        )
+    ).all()
+    dialogs = {
+        (dialog.telegram_account_id, dialog.peer_id): (dialog, entity)
+        for dialog, entity in dialog_rows
+    }
+    entity_ids = {entity.id for _, entity in dialog_rows if entity and entity.photo_id}
+    avatar_photo_ids = {
+        entity_id: photo_id
+        for entity_id, photo_id in (
+            await db.execute(
+                select(
+                    TelegramEntityPhoto.entity_id,
+                    TelegramEntityPhoto.telegram_photo_id,
+                )
+                .join(TelegramEntity, TelegramEntity.id == TelegramEntityPhoto.entity_id)
+                .where(
+                    TelegramEntityPhoto.entity_id.in_(entity_ids),
+                    TelegramEntityPhoto.telegram_photo_id == TelegramEntity.photo_id,
                     TelegramEntityPhoto.variant == "small",
                     TelegramEntityPhoto.status == "available",
                 )
             )
+        ).all()
+    } if entity_ids else {}
+
+    items: list[dict[str, object]] = []
+    for rule in rules:
+        key = (rule.telegram_account_id, rule.peer_id)
+        state = states.get(rule.id)
+        latest = latest_runs.get(rule.id)
+        history_state = history_states.get(rule.id)
+        latest_history = latest_history_runs.get(rule.id)
+        history_progress = await history_sweep_progress(db, history_state, latest_history)
+        dialog, entity = dialogs.get(key, (None, None))
+        is_self = bool(account and rule.peer_id == account.telegram_user_id)
+        avatar_photo_id = avatar_photo_ids.get(entity.id) if entity else None
+        message_count = message_counts.get(key, 0)
+        media_count, media_size_bytes = media_stats.get(key, (0, 0))
         items.append(
             {
                 "id": rule.id,
@@ -147,8 +243,8 @@ async def list_rules(user: CurrentUser, db: Db) -> dict[str, object]:
                     else None
                 ),
                 "message_count": message_count or 0,
-                "media_count": len(unique_media),
-                "media_size_bytes": sum(unique_media.values()),
+                "media_count": media_count,
+                "media_size_bytes": media_size_bytes,
                 "rule": serialize_rule(rule, state),
                 "state": {
                     "status": state.status if state else "idle",
@@ -161,28 +257,42 @@ async def list_rules(user: CurrentUser, db: Db) -> dict[str, object]:
                 "latest_run": serialize_run(latest),
                 "history_update": {
                     "enabled": rule.history_enabled,
-                    "status": history_state.status if history_state else "idle",
+                    "status": history_progress["status"] if history_progress else (history_state.status if history_state else "idle"),
+                    "has_remaining": history_progress["has_remaining"] if history_progress else False,
+                    "next_run_at": history_state.next_run_at if history_state else None,
                     "last_completed_at": (
                         history_state.last_completed_at if history_state else None
                     ),
-                    "latest_run": (
-                        {
-                            "id": latest_history.id,
-                            "status": latest_history.status,
-                            "candidate_count": latest_history.candidate_count,
-                            "checked_count": latest_history.checked_count,
-                            "changed_count": latest_history.changed_count,
-                            "deleted_count": latest_history.deleted_count,
-                            "media_completed_count": latest_history.media_completed_count,
-                            "error_count": latest_history.error_count,
-                        }
-                        if latest_history
-                        else None
-                    ),
+                    "latest_run": history_progress,
                 },
             }
         )
     return {"items": items, "count": len(items)}
+
+
+@router.get("/cron-preview")
+async def preview_cron(
+    user: CurrentUser,
+    expression: str = Query(min_length=1, max_length=100),
+) -> dict[str, object]:
+    del user  # Authentication is required even though the preview is user-independent.
+    normalized = normalize_cron(expression)
+    local_now = datetime.now().astimezone()
+    offset = local_now.strftime("%z")
+    offset_label = f"UTC{offset[:3]}:{offset[3:]}" if offset else "服务器本地时间"
+    if not is_valid_five_field_cron(normalized):
+        return {
+            "valid": False,
+            "expression": normalized,
+            "timezone": offset_label,
+            "runs": [],
+        }
+    return {
+        "valid": True,
+        "expression": normalized,
+        "timezone": offset_label,
+        "runs": [value.isoformat() for value in next_cron_runs(normalized, local_now)],
+    }
 
 
 @router.put("/{peer_id}")

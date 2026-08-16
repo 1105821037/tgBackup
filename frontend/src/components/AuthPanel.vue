@@ -66,7 +66,7 @@ async function submit() {
           maxlength="256"
           required
         />
-        <small v-if="isSetup">至少 10 个字符。密码仅保存为 Argon2 哈希。</small>
+        <small v-if="isSetup">至少 10 个字符。</small>
       </label>
 
       <p v-if="error" class="inline-error" role="alert">{{ error }}</p>

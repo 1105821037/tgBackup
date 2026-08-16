@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
+from time import perf_counter
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -8,7 +10,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
 from .backup_scheduler import coordinator
+from .db import engine
 from .entity_service import entity_refresh_coordinator
+from .media_preview import start_media_preview_workers, stop_media_preview_workers
 from .origin_utils import is_allowed_browser_origin
 from .routes_auth import router as auth_router
 from .routes_archive import router as archive_router
@@ -24,19 +28,36 @@ from .telegram_runtime import runtime_manager
 
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await runtime_manager.start()
-    await coordinator.start()
-    await entity_refresh_coordinator.start()
     try:
+        await start_media_preview_workers(
+            settings.media_preview_worker_count,
+            settings.media_preview_queue_size,
+        )
+        await runtime_manager.start()
+        await coordinator.start()
+        await entity_refresh_coordinator.start()
         yield
     finally:
-        await entity_refresh_coordinator.stop()
-        await coordinator.stop()
-        await runtime_manager.stop()
+        # Stop producers before their shared Telegram clients, then release the
+        # database pool while the event loop is still alive.
+        try:
+            await entity_refresh_coordinator.stop()
+        finally:
+            try:
+                await coordinator.stop()
+            finally:
+                try:
+                    await runtime_manager.stop()
+                finally:
+                    try:
+                        await stop_media_preview_workers()
+                    finally:
+                        await engine.dispose()
 
 
 app = FastAPI(title="tgBackup", version="0.2.0", lifespan=lifespan)
@@ -59,7 +80,18 @@ async def reject_foreign_browser_origins(request: Request, call_next):
             settings.allowed_frontend_origins,
         ):
             return JSONResponse(status_code=403, content={"detail": "不允许的请求来源"})
-    return await call_next(request)
+    started = perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (perf_counter() - started) * 1000
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    if elapsed_ms >= max(0, settings.slow_request_log_seconds) * 1000:
+        logger.warning(
+            "Slow request %s %s completed in %.1f ms",
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+    return response
 
 
 @app.get("/api/health")

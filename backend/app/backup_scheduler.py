@@ -127,10 +127,13 @@ class BackupCoordinator:
         if self._scheduler_task:
             self._scheduler_task.cancel()
             await asyncio.gather(self._scheduler_task, return_exceptions=True)
+            self._scheduler_task = None
         for task in tuple(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+        self._history_tasks.clear()
 
     def launch(
         self,
@@ -173,6 +176,8 @@ class BackupCoordinator:
             backup_rule(rule_id, trigger, schedule_key, activity.set),
             name=f"tg-backup-pipeline-{rule_id}",
         )
+        activity_waiter: asyncio.Task[bool] | None = None
+        deadline_waiter: asyncio.Task[None] | None = None
         try:
             while not pipeline.done():
                 activity.clear()
@@ -208,12 +213,23 @@ class BackupCoordinator:
                     "Backup watchdog for rule %s persisted expiration", rule_id
                 )
                 pipeline.cancel()
-                pipeline.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
                 break
         except (PipelineFailure, asyncio.CancelledError):
-            pipeline.cancel()
             pass
         finally:
+            # Cancelling this coordinator task does not automatically cancel the
+            # pipeline and watchdog waiters it created.  Always join them before
+            # shutdown continues to the Telegram clients; otherwise Telethon's
+            # connection loops can outlive the application event loop.
+            child_tasks = [
+                task
+                for task in (activity_waiter, deadline_waiter, pipeline)
+                if task is not None
+            ]
+            for task in child_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*child_tasks, return_exceptions=True)
             self._active_rule_ids.discard(rule_id)
 
     async def _run_history(

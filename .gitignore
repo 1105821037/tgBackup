@@ -6,7 +6,7 @@ data/probes/
 data/accounts/
 data/avatars/
 data/media/
-data/profile.key
+data/previews/
 data/*.log
 frontend/node_modules/
 frontend/*.tsbuildinfo

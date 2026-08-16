@@ -6,6 +6,8 @@ import {
   type ArchiveMessage,
   type ArchiveMessageMedia,
   type ArchiveMessagePage,
+  type ArchiveMessageSearchItem,
+  type ArchiveMessageSearchPage,
   type ArchiveSharedMediaItem,
   type ArchiveSharedMediaPage,
   type ArchiveMessageVersions,
@@ -13,6 +15,7 @@ import {
 } from '../api'
 import type { RealtimeEvent } from '../realtime'
 import { calculateAlbumLayout, type AlbumLayout } from '../utils/albumLayout'
+import { serverDate } from '../utils/dateTime'
 import {
   buildArchiveMessagePresentation,
   isAudioMedia,
@@ -25,6 +28,8 @@ import ArchiveSpecialContent from './ArchiveSpecialContent.vue'
 import TelegramAudioPlayer from './TelegramAudioPlayer.vue'
 import TgsSticker from './TgsSticker.vue'
 import TelegramCustomEmoji from './TelegramCustomEmoji.vue'
+
+const emit = defineEmits<{ 'mobile-detail-change': [open: boolean] }>()
 
 const chats = ref<ArchiveChat[]>([])
 const selected = ref<ArchiveChat | null>(null)
@@ -42,29 +47,65 @@ const nextAfterId = ref<number | null>(null)
 const infoOpen = ref(true)
 type SharedMediaTab = 'media' | 'documents' | 'links' | 'audio' | 'voice' | 'gif'
 const sharedMediaTab = ref<SharedMediaTab>('media')
-const sharedMediaItems = ref<ArchiveSharedMediaItem[]>([])
+const sharedMediaScrollTops: Partial<Record<SharedMediaTab, number>> = {}
+const sharedMediaByIndex = ref<Record<number, ArchiveSharedMediaItem>>({})
+const sharedMediaItems = computed(() => Object.entries(sharedMediaByIndex.value)
+  .sort(([left], [right]) => Number(left) - Number(right))
+  .map(([, item]) => item))
+const sharedMediaTotal = ref(0)
 const sharedMediaLoading = ref(false)
 const sharedMediaLoadingMore = ref(false)
 const sharedMediaHasMore = ref(false)
-const sharedMediaBeforeId = ref<number | null>(null)
 const sharedMediaError = ref('')
+const infoScroll = ref<HTMLElement | null>(null)
+const chatList = ref<HTMLElement | null>(null)
+const sharedMediaVirtual = ref<HTMLElement | null>(null)
+const sharedMediaViewportWidth = ref(300)
+const sharedMediaWindow = ref({ start: 0, end: -1 })
+const sharedScrollbar = ref<HTMLElement | null>(null)
+const sharedScrollbarThumb = ref<HTMLElement | null>(null)
+const sharedScrollbarVisible = ref(false)
+const sharedScrollbarDragging = ref(false)
+const sharedScrollbarBubbleVisible = ref(false)
+const sharedScrollbarThumbTop = ref(0)
+const sharedScrollbarBubbleTop = ref(0)
+const sharedScrollbarLabel = ref('')
 const sharedMediaKinds = ref({ photo: true, video: true })
 const sharedContextMenu = ref<{ item: ArchiveSharedMediaItem; x: number; y: number } | null>(null)
 const sharedContextMenuButton = ref<HTMLButtonElement | null>(null)
 const mobileThreadOpen = ref(false)
+const mobileNavigationDirection = ref<'forward' | 'back' | null>(null)
+const mobileTransitionDirection = ref<'forward' | 'back'>('forward')
+const mobileTransitionFrom = ref<ArchiveMobileLayer>('list')
 const newMessageCount = ref(0)
 const messageViewport = ref<HTMLElement | null>(null)
 const messagePositionReady = ref(false)
+const messageSearchOpen = ref(false)
+const messageSearchQuery = ref('')
+const messageSearchResults = ref<ArchiveMessageSearchItem[]>([])
+const messageSearchTotal = ref(0)
+const messageSearchActiveIndex = ref(-1)
+const messageSearchLoading = ref(false)
+const messageSearchLoadingMore = ref(false)
+const messageSearchError = ref('')
+const messageSearchInput = ref<HTMLInputElement | null>(null)
+let olderLoadNeedsFreshGesture = false
+let lastUpwardWheelAt = 0
+let messageSearchTimer = 0
+let messageSearchRequestId = 0
+const WHEEL_GESTURE_IDLE_MS = 320
 const messageViewportWidth = ref(480)
 const mediaDimensions = ref<Record<number, { width: number; height: number }>>({})
 const mediaDurations = ref<Record<number, number>>({})
 const mediaRemaining = ref<Record<number, number>>({})
 const mediaPosters = ref<Record<number, string>>({})
 const sharedMediaPosters = ref<Record<number, string>>({})
+const failedPreviewIds = ref<Set<number>>(new Set())
 const stickyDateLabel = ref('')
 const viewerIndex = ref<number | null>(null)
 const viewerZoom = ref(1)
 const viewerPan = ref({ x: 0, y: 0 })
+const viewerSwipeX = ref(0)
 const viewerDragging = ref(false)
 const viewerStage = ref<HTMLElement | null>(null)
 const viewerMedia = ref<HTMLImageElement | HTMLVideoElement | null>(null)
@@ -91,12 +132,34 @@ const jumpNotice = ref('')
 let senderProfileRequestId = 0
 let sharedMediaRequestId = 0
 let senderProfileTrigger: HTMLElement | null = null
-let viewerDragOrigin: { pointerId: number; clientX: number; clientY: number; x: number; y: number } | null = null
+let viewerDragOrigin: { pointerId: number; clientX: number; clientY: number; startedAt: number; x: number; y: number; mode: 'pan' | 'swipe' } | null = null
 let suppressViewerClick = false
 let viewportObserver: ResizeObserver | null = null
+let infoScrollObserver: ResizeObserver | null = null
 let inlineVideoObserver: IntersectionObserver | null = null
+let sharedScrollbarFrame = 0
+let archiveSnapshotTimer = 0
+let archiveNavigationSequence = 0
+let lastAppliedArchiveEntry = ''
+let activeArchiveStackIndex = 0
+let sharedScrollbarBubbleTimer = 0
+let sharedScrollbarDrag: { pointerId: number; offsetY: number } | null = null
+let sharedLongPressTimer = 0
+let sharedLongPress: {
+  item: ArchiveSharedMediaItem
+  pointerId: number
+  startX: number
+  startY: number
+  viewer: boolean
+} | null = null
+let sharedLongPressSuppression: { mediaId: number; expiresAt: number } | null = null
+let sharedMediaLoadedPages = new Set<number>()
+let sharedMediaPendingPages = new Set<number>()
+let sharedMediaFailedPages = new Set<number>()
 const visibleInlineVideos = new Set<HTMLVideoElement>()
 const MESSAGE_WINDOW_LIMIT = 240
+const SHARED_MEDIA_PAGE_SIZE = 60
+const SHARED_MEDIA_BUFFER_VIEWPORTS = 2
 
 interface ArchiveEntry {
   key: string
@@ -105,6 +168,145 @@ interface ArchiveEntry {
   last: ArchiveMessage
   media: ArchiveMessageMedia[]
   text: string
+}
+
+type ArchiveMobileLayer = 'list' | 'thread' | 'info'
+
+interface ArchiveMobileRoute {
+  layer: ArchiveMobileLayer
+  peerId: number | null
+}
+
+interface ArchiveInfoSnapshot {
+  tab: SharedMediaTab
+  photo: boolean
+  video: boolean
+  scrollTop: number
+  anchorIndex: number | null
+  anchorOffset: number
+  tabScrollTops: Partial<Record<SharedMediaTab, number>>
+}
+
+interface ArchiveThreadSnapshot {
+  messageId: number | null
+  offset: number
+  atBottom: boolean
+}
+
+interface ArchiveListSnapshot {
+  scrollTop: number
+  query: string
+}
+
+type ArchiveOverlaySnapshot =
+  | { type: 'viewer'; mediaId: number; origin: 'messages' | 'shared' }
+  | { type: 'history'; messageId: number }
+  | { type: 'profile'; messageId: number }
+  | { type: 'search'; query: string }
+
+interface ArchiveHistoryFrame {
+  entryId: string
+  stackIndex: number
+  layer: ArchiveMobileLayer
+  peerId: number | null
+  info?: ArchiveInfoSnapshot
+  thread?: ArchiveThreadSnapshot
+  list?: ArchiveListSnapshot
+  overlay?: ArchiveOverlaySnapshot
+}
+
+function isMobileArchive() {
+  return window.matchMedia('(max-width: 760px)').matches
+}
+
+function archiveRouteFromLocation(): ArchiveMobileRoute {
+  const match = window.location.hash.match(/^#\/archive(?:\/chat\/(-?\d+)(?:\/(info))?)?\/?$/)
+  if (!match?.[1]) return { layer: 'list', peerId: null }
+  const peerId = Number(match[1])
+  if (!Number.isSafeInteger(peerId)) return { layer: 'list', peerId: null }
+  return { layer: match[2] === 'info' ? 'info' : 'thread', peerId }
+}
+
+function archiveRouteHash(layer: ArchiveMobileLayer, peerId = selected.value?.peer_id) {
+  if (layer === 'list' || !peerId) return '#/archive'
+  return `#/archive/chat/${peerId}${layer === 'info' ? '/info' : ''}`
+}
+
+function currentArchiveFrame(): ArchiveHistoryFrame | null {
+  const frame = window.history.state?.tgArchive
+  return frame && typeof frame === 'object' ? frame as ArchiveHistoryFrame : null
+}
+
+function archiveHistoryState(frame: ArchiveHistoryFrame) {
+  const current = window.history.state
+  return {
+    ...(current && typeof current === 'object' ? current : {}),
+    tgArchiveDepth: frame.stackIndex,
+    tgArchive: frame,
+  }
+}
+
+function makeArchiveEntryId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+function writeArchiveRoute(
+  layer: ArchiveMobileLayer,
+  replace = false,
+  snapshot: Pick<ArchiveHistoryFrame, 'info' | 'thread' | 'list' | 'overlay'> = {},
+) {
+  if (!isMobileArchive()) return
+  const current = currentArchiveFrame()
+  const stackIndex = replace ? current?.stackIndex ?? 0 : (current?.stackIndex ?? -1) + 1
+  const frame: ArchiveHistoryFrame = {
+    entryId: makeArchiveEntryId(),
+    stackIndex,
+    layer,
+    peerId: layer === 'list' ? null : selected.value?.peer_id ?? null,
+    ...snapshot,
+  }
+  const method = replace ? 'replaceState' : 'pushState'
+  window.history[method](archiveHistoryState(frame), '', archiveRouteHash(layer))
+  lastAppliedArchiveEntry = frame.entryId
+  activeArchiveStackIndex = frame.stackIndex
+}
+
+function ensureArchiveHistoryFrame(layer: ArchiveMobileLayer, peerId: number | null) {
+  if (!isMobileArchive()) return
+  const current = currentArchiveFrame()
+  if (current?.layer === layer && current.peerId === peerId) return
+  const frame: ArchiveHistoryFrame = {
+    entryId: makeArchiveEntryId(),
+    stackIndex: current?.stackIndex ?? 0,
+    layer,
+    peerId,
+  }
+  window.history.replaceState(archiveHistoryState(frame), '', archiveRouteHash(layer, peerId ?? undefined))
+  activeArchiveStackIndex = frame.stackIndex
+}
+
+function pushArchiveOverlay(overlay: ArchiveOverlaySnapshot) {
+  if (!isMobileArchive()) return
+  flushArchiveSnapshot()
+  const current = currentArchiveFrame()
+  if (!current || current.overlay) return
+  const frame: ArchiveHistoryFrame = {
+    ...current,
+    entryId: makeArchiveEntryId(),
+    stackIndex: current.stackIndex + 1,
+    overlay,
+  }
+  window.history.pushState(archiveHistoryState(frame), '', window.location.href)
+  lastAppliedArchiveEntry = frame.entryId
+  activeArchiveStackIndex = frame.stackIndex
+}
+
+function popArchiveOverlay(type: ArchiveOverlaySnapshot['type']) {
+  const frame = currentArchiveFrame()
+  if (!isMobileArchive() || frame?.overlay?.type !== type || frame.stackIndex <= 0) return false
+  flushArchiveSnapshot()
+  window.history.back()
+  return true
 }
 
 const filteredChats = computed(() => {
@@ -164,7 +366,8 @@ const sharedViewerItems = computed<ViewerItem[]>(() => sharedMediaItems.value
     const message: ArchiveMessage = {
       id: media.message_id, message_id: media.message_id, sent_at: media.sent_at, text: media.text,
       content_kind: media.type, content: media.content, out: false, post: false, buttons: [], entities: [],
-      is_deleted: false, is_edited: false, current_version: 1, observed_at: media.sent_at || '', metrics: {}, media: [media],
+      is_deleted: false, is_edited: Boolean(media.is_history_version), current_version: media.current_version || 1,
+      displayed_version: media.version || media.current_version || 1, is_restored: false, observed_at: media.sent_at || '', metrics: {}, media: [media],
     }
     const entry: ArchiveEntry = { key: `shared-${media.id}`, items: [message], first: message, last: message, media: [media], text: media.text || '' }
     return { media, message, entry }
@@ -308,12 +511,6 @@ function avatarText(value: { title?: string; name?: string }) {
 
 function avatarHue(id: number) {
   return { '--avatar-hue': String(Math.abs(id) % 360) }
-}
-
-function serverDate(value: string) {
-  // MySQL returns UTC datetimes without an offset. Make that explicit and let
-  // Intl.DateTimeFormat present them in the operating system's local timezone.
-  return new Date(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`)
 }
 
 function formatListTime(value?: string | null) {
@@ -483,8 +680,9 @@ function senderProfileAvatar() {
     || null
 }
 
-async function openSenderProfile(entry: ArchiveEntry, event?: Event) {
+async function openSenderProfile(entry: ArchiveEntry, event?: Event, recordHistory = true) {
   const sender = entrySender(entry)
+  if (recordHistory) pushArchiveOverlay({ type: 'profile', messageId: entry.first.message_id })
   const requestId = ++senderProfileRequestId
   senderProfileTrigger = event?.currentTarget instanceof HTMLElement ? event.currentTarget : null
   senderProfile.value = {
@@ -514,7 +712,8 @@ async function openSenderProfile(entry: ArchiveEntry, event?: Event) {
   }
 }
 
-function closeSenderProfile() {
+function closeSenderProfile(fromHistory = false) {
+  if (!fromHistory && popArchiveOverlay('profile')) return
   const trigger = senderProfileTrigger
   senderProfileRequestId += 1
   senderProfile.value = null
@@ -598,6 +797,10 @@ function entryIsEdited(entry: ArchiveEntry) {
   return entry.items.some((item) => item.is_edited)
 }
 
+function entryIsRestored(entry: ArchiveEntry) {
+  return entry.items.some((item) => item.is_restored)
+}
+
 function entryIsDeleted(entry: ArchiveEntry) {
   return entry.items.every((item) => item.is_deleted)
 }
@@ -607,11 +810,14 @@ function entryVersions(entry: ArchiveEntry) {
 }
 
 function entryHistoryMessage(entry: ArchiveEntry) {
-  return entry.items.find((item) => item.current_version > 1 || item.is_deleted) || entry.first
+  return entry.items.find((item) => item.is_restored)
+    || entry.items.find((item) => item.current_version > 1 || item.is_deleted)
+    || entry.first
 }
 
-async function openMessageHistory(entry: ArchiveEntry) {
+async function openMessageHistory(entry: ArchiveEntry, recordHistory = true) {
   const message = entryHistoryMessage(entry)
+  if (recordHistory) pushArchiveOverlay({ type: 'history', messageId: message.message_id })
   historyMessage.value = message
   historyData.value = null
   historyError.value = ''
@@ -626,7 +832,8 @@ async function openMessageHistory(entry: ArchiveEntry) {
   }
 }
 
-function closeMessageHistory() {
+function closeMessageHistory(fromHistory = false) {
+  if (!fromHistory && popArchiveOverlay('history')) return
   historyMessage.value = null
   historyData.value = null
   historyError.value = ''
@@ -676,11 +883,33 @@ function rememberVideoMetadata(media: ArchiveMessageMedia, event: Event) {
   captureInlineVideoPoster(media, video)
 }
 
+function mediaPreviewUrl(media: ArchiveMessageMedia) {
+  return media.preview_url && !failedPreviewIds.value.has(media.id)
+    ? media.preview_url
+    : media.url
+}
+
+function mediaPosterUrl(media: ArchiveMessageMedia) {
+  if (media.preview_url && !failedPreviewIds.value.has(media.id)) return media.preview_url
+  return mediaPosters.value[media.id] || sharedMediaPosters.value[media.id] || ''
+}
+
+async function handleMediaPreviewError(media: ArchiveMessageMedia, event: Event) {
+  if (!media.preview_url || failedPreviewIds.value.has(media.id)) return
+  failedPreviewIds.value = new Set(failedPreviewIds.value).add(media.id)
+  await nextTick()
+  const container = (event.currentTarget as HTMLElement).parentElement
+  const video = container?.querySelector('video')
+  if (video instanceof HTMLVideoElement && video.readyState >= 2) {
+    captureInlineVideoPoster(media, video)
+  }
+}
+
 function captureInlineVideoPoster(media: ArchiveMessageMedia, source: Event | HTMLVideoElement) {
   const video = source instanceof HTMLVideoElement
     ? source
     : source.currentTarget as HTMLVideoElement
-  if (mediaPosters.value[media.id] || !video.videoWidth || !video.videoHeight || video.readyState < 2) return
+  if ((media.preview_url && !failedPreviewIds.value.has(media.id)) || mediaPosters.value[media.id] || !video.videoWidth || !video.videoHeight || video.readyState < 2) return
 
   const capture = () => {
     if (mediaPosters.value[media.id] || !video.videoWidth || !video.videoHeight) return
@@ -814,6 +1043,7 @@ function formatMediaDuration(value?: number) {
 function mediaRatio(media: ArchiveMessageMedia) {
   const dimensions = mediaDimensions.value[media.id]
   if (dimensions) return dimensions.width / dimensions.height
+  if (media.width && media.height) return media.width / media.height
   return media.type === 'video' ? 16 / 9 : 1
 }
 
@@ -822,6 +1052,14 @@ function singleMediaStyle(media: ArchiveMessageMedia) {
 }
 
 function setInlineVideoState(video: HTMLVideoElement) {
+  // Telegram Web A does not connect videos inside an album to its playback
+  // intersection observer. Album tiles stay as previews until the user opens
+  // the media viewer, otherwise every visible video in one bubble plays at once.
+  if (video.classList.contains('archive-album-video')) {
+    video.pause()
+    return
+  }
+
   const shouldPlay = visibleInlineVideos.has(video)
     && document.visibilityState === 'visible'
     && viewerIndex.value === null
@@ -880,6 +1118,7 @@ function handleDocumentVisibility() {
       else window.setTimeout(reveal, 80)
     })
   }
+  if (document.visibilityState === 'hidden') flushArchiveSnapshot()
   refreshInlineVideoPlayback()
 }
 
@@ -887,7 +1126,14 @@ const albumLayouts = computed<Record<string, AlbumLayout>>(() => {
   const layouts: Record<string, AlbumLayout> = {}
   for (const entry of displayEntries.value) {
     if (!entryPresentation(entry).isVisualAlbum) continue
-    const available = Math.min(480, Math.max(230, messageViewportWidth.value - (entry.first.out ? 18 : 54)))
+    const hasAvatarColumn = groupShowsSender() && !entry.first.out
+    const maximum = entry.first.out ? 480 : 464
+    const reservedWidth = hasAvatarColumn ? 112 : 72
+    // Albums with captions have a 2px inset on both sides inside the bubble.
+    // Reserve that space before calculating absolute tile coordinates, so the
+    // child grid cannot make the border-box wider than the mobile viewport.
+    const bubbleInset = entryPresentation(entry).isMediaOnly ? 0 : 4
+    const available = Math.min(maximum, Math.max(160, messageViewportWidth.value - reservedWidth - bubbleInset))
     layouts[entry.key] = calculateAlbumLayout(entry.media.map(mediaRatio), available)
   }
   return layouts
@@ -902,6 +1148,18 @@ function albumContainerStyle(entry: ArchiveEntry) {
   return { width: `${layout.width}px`, height: `${layout.height}px` }
 }
 
+function visualMediaBubbleStyle(entry: ArchiveEntry) {
+  const presentation = entryPresentation(entry)
+  if (presentation.isVisualAlbum) {
+    const bubbleInset = presentation.isMediaOnly ? 0 : 4
+    return { '--archive-album-width': `${entryAlbumLayout(entry).width + bubbleInset}px` }
+  }
+  if (presentation.hasVisualMedia && entry.media.length === 1) {
+    return { '--media-ratio': String(Math.min(4, Math.max(.28, mediaRatio(entry.media[0])))) }
+  }
+  return undefined
+}
+
 function albumTileStyle(entry: ArchiveEntry, index: number) {
   const tile = entryAlbumLayout(entry).tiles[index]
   return tile ? {
@@ -909,73 +1167,492 @@ function albumTileStyle(entry: ArchiveEntry, index: number) {
   } : undefined
 }
 
-function openMedia(media: ArchiveMessageMedia) {
+function openMedia(media: ArchiveMessageMedia, recordHistory = true) {
   const index = viewerItems.value.findIndex((item) => item.media.id === media.id)
   if (index < 0) return
   viewerOrigin.value = 'messages'
+  if (recordHistory) pushArchiveOverlay({ type: 'viewer', mediaId: media.id, origin: 'messages' })
   viewerIndex.value = index
   resetViewerTransform()
   document.body.classList.add('archive-viewer-open')
 }
 
-function openSharedMedia(media: ArchiveSharedMediaItem) {
+function openSharedMedia(media: ArchiveSharedMediaItem, recordHistory = true) {
   const index = sharedViewerItems.value.findIndex((item) => item.media.id === media.id)
   if (index < 0) return
   viewerOrigin.value = 'shared'
+  if (recordHistory) pushArchiveOverlay({ type: 'viewer', mediaId: media.id, origin: 'shared' })
   viewerIndex.value = index
   resetViewerTransform()
   document.body.classList.add('archive-viewer-open')
 }
 
-async function loadSharedMedia(append = false) {
-  const chat = selected.value
-  if (!chat || (append && sharedMediaLoadingMore.value)) return
-  const requestId = ++sharedMediaRequestId
-  if (append) sharedMediaLoadingMore.value = true
-  else {
-    sharedMediaLoading.value = true
-    sharedMediaItems.value = []
-    sharedMediaPosters.value = {}
-    sharedMediaBeforeId.value = null
+function sharedMediaLayout() {
+  const visual = ['media', 'gif'].includes(sharedMediaTab.value)
+  const columns = visual ? 3 : 1
+  const gap = visual ? 1 : 0
+  const padding = visual ? 0 : 4
+  const width = Math.max(1, sharedMediaViewportWidth.value - padding * 2)
+  const itemWidth = visual ? (width - gap * (columns - 1)) / columns : width
+  return {
+    columns,
+    gap,
+    padding,
+    itemWidth,
+    rowHeight: visual ? itemWidth + gap : 68,
   }
-  sharedMediaError.value = ''
-  try {
-    const before = append && sharedMediaBeforeId.value ? `&before_id=${sharedMediaBeforeId.value}` : ''
-    const kind = sharedMediaKinds.value.photo && sharedMediaKinds.value.video
-      ? 'all'
-      : sharedMediaKinds.value.photo ? 'photo' : 'video'
-    const filter = sharedMediaTab.value === 'media' ? `&media_filter=${kind}` : ''
-    const result = await api<ArchiveSharedMediaPage>(`/api/archive/chats/${chat.peer_id}/shared-media?type=${sharedMediaTab.value}&limit=60${filter}${before}`)
-    if (requestId !== sharedMediaRequestId || selected.value?.peer_id !== chat.peer_id) return
-    sharedMediaItems.value = append ? [...sharedMediaItems.value, ...result.items] : result.items
-    sharedMediaHasMore.value = result.has_more
-    sharedMediaBeforeId.value = result.next_before_id || null
-  } catch (value) {
-    if (requestId !== sharedMediaRequestId) return
-    sharedMediaError.value = value instanceof Error ? value.message : '无法读取共享媒体'
-  } finally {
-    if (requestId === sharedMediaRequestId) {
-      sharedMediaLoading.value = false
-      sharedMediaLoadingMore.value = false
+}
+
+function sharedMediaVirtualHeight() {
+  const layout = sharedMediaLayout()
+  return Math.ceil(sharedMediaTotal.value / layout.columns) * layout.rowHeight + layout.padding * 2
+}
+
+const sharedMediaVisibleSlots = computed(() => {
+  const layout = sharedMediaLayout()
+  const slots: Array<{ index: number; item?: ArchiveSharedMediaItem; style: Record<string, string> }> = []
+  for (let index = sharedMediaWindow.value.start; index <= sharedMediaWindow.value.end; index += 1) {
+    const row = Math.floor(index / layout.columns)
+    const column = index % layout.columns
+    slots.push({
+      index,
+      item: sharedMediaByIndex.value[index],
+      style: {
+        left: `${layout.padding + column * (layout.itemWidth + layout.gap)}px`,
+        top: `${layout.padding + row * layout.rowHeight}px`,
+        width: `${layout.itemWidth}px`,
+        height: `${layout.rowHeight - layout.gap}px`,
+      },
+    })
+  }
+  return slots
+})
+
+function sharedMediaScrollMetrics() {
+  const content = infoScroll.value
+  const virtual = sharedMediaVirtual.value
+  if (!content || !virtual) return null
+  if (virtual.clientWidth > 0 && virtual.clientWidth !== sharedMediaViewportWidth.value) {
+    sharedMediaViewportWidth.value = virtual.clientWidth
+  }
+  const maxScroll = Math.max(0, content.scrollHeight - content.clientHeight)
+  const contentRect = content.getBoundingClientRect()
+  const virtualTop = virtual.getBoundingClientRect().top - contentRect.top + content.scrollTop
+  const mediaSection = virtual.closest<HTMLElement>('.archive-shared-media')
+  const tabs = mediaSection?.querySelector<HTMLElement>('.archive-shared-tabs')
+  // This directly mirrors `position: sticky; top: 0`: once the tab bar is
+  // clamped to the scroll viewport's top edge, the scrubber becomes available.
+  const tabsAreSticky = Boolean(tabs && tabs.getBoundingClientRect().top <= contentRect.top + 1)
+  const mediaStart = Math.min(virtualTop, maxScroll)
+  const mediaRange = Math.max(0, maxScroll - mediaStart)
+  return {
+    content,
+    maxScroll,
+    mediaStart,
+    mediaRange: Math.max(1, mediaRange),
+    mediaScrollable: mediaRange > 1,
+    virtualTop,
+    tabsAreSticky,
+  }
+}
+
+function cloneInfoSnapshot(snapshot: ArchiveInfoSnapshot): ArchiveInfoSnapshot {
+  return { ...snapshot, tabScrollTops: { ...snapshot.tabScrollTops } }
+}
+
+function freshInfoSnapshot(): ArchiveInfoSnapshot {
+  return {
+    tab: 'media',
+    photo: true,
+    video: true,
+    scrollTop: 0,
+    anchorIndex: null,
+    anchorOffset: 0,
+    tabScrollTops: {},
+  }
+}
+
+function captureInfoSnapshot(): ArchiveInfoSnapshot | null {
+  const content = infoScroll.value
+  if (!content) return null
+  const metrics = sharedMediaScrollMetrics()
+  let anchorIndex: number | null = null
+  let anchorOffset = 0
+  if (metrics && content.scrollTop >= metrics.virtualTop) {
+    const layout = sharedMediaLayout()
+    const row = Math.max(0, Math.floor((content.scrollTop - metrics.virtualTop) / layout.rowHeight))
+    anchorIndex = Math.min(Math.max(0, sharedMediaTotal.value - 1), row * layout.columns)
+    anchorOffset = content.scrollTop - (metrics.virtualTop + row * layout.rowHeight)
+  }
+  return {
+    tab: sharedMediaTab.value,
+    photo: sharedMediaKinds.value.photo,
+    video: sharedMediaKinds.value.video,
+    scrollTop: content.scrollTop,
+    anchorIndex,
+    anchorOffset,
+    tabScrollTops: { ...sharedMediaScrollTops, [sharedMediaTab.value]: content.scrollTop },
+  }
+}
+
+function captureThreadSnapshot(): ArchiveThreadSnapshot | null {
+  const viewport = messageViewport.value
+  if (!viewport) return null
+  const atBottom = nearBottom()
+  const viewportTop = viewport.getBoundingClientRect().top
+  const line = [...viewport.querySelectorAll<HTMLElement>('.archive-message-line')]
+    .find((candidate) => candidate.getBoundingClientRect().bottom >= viewportTop)
+  if (!line) return { messageId: null, offset: 0, atBottom }
+  const messageId = Number(line.dataset.messageIds?.split(' ')[0])
+  return {
+    messageId: Number.isSafeInteger(messageId) ? messageId : null,
+    offset: line.getBoundingClientRect().top - viewportTop,
+    atBottom,
+  }
+}
+
+function captureListSnapshot(): ArchiveListSnapshot {
+  return { scrollTop: chatList.value?.scrollTop || 0, query: query.value }
+}
+
+function persistCurrentArchiveSnapshot() {
+  if (!isMobileArchive()) return
+  const frame = currentArchiveFrame()
+  if (!frame || (frame.peerId !== null && frame.peerId !== selected.value?.peer_id)) return
+  const next: ArchiveHistoryFrame = { ...frame }
+  if (frame.layer === 'info') {
+    const snapshot = captureInfoSnapshot()
+    if (snapshot) next.info = snapshot
+  } else if (frame.layer === 'thread') {
+    const snapshot = captureThreadSnapshot()
+    if (snapshot && (snapshot.messageId || snapshot.atBottom || !next.thread?.messageId)) next.thread = snapshot
+  } else {
+    next.list = captureListSnapshot()
+  }
+  window.history.replaceState(archiveHistoryState(next), '', window.location.href)
+}
+
+function scheduleArchiveSnapshot() {
+  if (!isMobileArchive() || archiveSnapshotTimer) return
+  archiveSnapshotTimer = window.setTimeout(() => {
+    archiveSnapshotTimer = 0
+    persistCurrentArchiveSnapshot()
+  }, 120)
+}
+
+function flushArchiveSnapshot() {
+  if (archiveSnapshotTimer) window.clearTimeout(archiveSnapshotTimer)
+  archiveSnapshotTimer = 0
+  persistCurrentArchiveSnapshot()
+}
+
+async function restoreInfoSnapshot(snapshot: ArchiveInfoSnapshot | undefined, navigationId = archiveNavigationSequence) {
+  if (!snapshot) return
+  const configurationChanged = sharedMediaTab.value !== snapshot.tab
+    || sharedMediaKinds.value.photo !== snapshot.photo
+    || sharedMediaKinds.value.video !== snapshot.video
+  sharedMediaTab.value = snapshot.tab
+  sharedMediaKinds.value = { photo: snapshot.photo, video: snapshot.video }
+  for (const tab of sharedMediaTabs) delete sharedMediaScrollTops[tab.type]
+  Object.assign(sharedMediaScrollTops, snapshot.tabScrollTops)
+  if (configurationChanged || !sharedMediaTotal.value) await loadSharedMedia(false)
+  if (navigationId !== archiveNavigationSequence) return
+  await nextTick()
+  if (navigationId !== archiveNavigationSequence || !infoOpen.value) return
+  const content = infoScroll.value
+  if (!content) return
+  if (snapshot.anchorIndex === null) {
+    content.scrollTop = snapshot.scrollTop
+  } else {
+    const metrics = sharedMediaScrollMetrics()
+    if (metrics) {
+      const layout = sharedMediaLayout()
+      const row = Math.floor(snapshot.anchorIndex / layout.columns)
+      content.scrollTop = metrics.virtualTop + row * layout.rowHeight + snapshot.anchorOffset
+      const page = Math.floor(snapshot.anchorIndex / SHARED_MEDIA_PAGE_SIZE)
+      if (!sharedMediaLoadedPages.has(page)) await fetchSharedMediaPage(page)
+      if (navigationId !== archiveNavigationSequence) return
+    }
+  }
+  await nextTick()
+  updateSharedMediaWindow()
+  updateSharedScrollbar()
+}
+
+async function restoreThreadSnapshot(snapshot: ArchiveThreadSnapshot | undefined, navigationId = archiveNavigationSequence) {
+  if (!snapshot) return
+  if (snapshot.atBottom) {
+    if (hasNewer.value) await loadMessages(false)
+    if (navigationId !== archiveNavigationSequence) return
+    await scrollToBottom()
+    return
+  }
+  if (!snapshot.messageId) return
+  await jumpToMessage(snapshot.messageId, false)
+  if (navigationId !== archiveNavigationSequence) return
+  await nextTick()
+  if (navigationId !== archiveNavigationSequence) return
+  const viewport = messageViewport.value
+  const target = viewport?.querySelector<HTMLElement>(`[data-message-ids~="${snapshot.messageId}"]`)
+  if (!viewport || !target) return
+  viewport.scrollTop += target.getBoundingClientRect().top - viewport.getBoundingClientRect().top - snapshot.offset
+  updateStickyDate()
+}
+
+async function restoreListSnapshot(snapshot: ArchiveListSnapshot | undefined, navigationId = archiveNavigationSequence) {
+  if (!snapshot) return
+  query.value = snapshot.query
+  await nextTick()
+  if (navigationId !== archiveNavigationSequence) return
+  if (chatList.value) chatList.value.scrollTop = snapshot.scrollTop
+}
+
+function closeActiveArchiveOverlay() {
+  if (viewerIndex.value !== null) closeViewer(true)
+  if (historyMessage.value) closeMessageHistory(true)
+  if (senderProfile.value) closeSenderProfile(true)
+  if (messageSearchOpen.value) closeMessageSearch(true)
+}
+
+async function restoreArchiveOverlay(overlay: ArchiveOverlaySnapshot | undefined, navigationId: number) {
+  if (!overlay || navigationId !== archiveNavigationSequence) return
+  if (overlay.type === 'search') {
+    messageSearchQuery.value = overlay.query
+    await openMessageSearch(false)
+    return
+  }
+  if (overlay.type === 'viewer') {
+    const items = overlay.origin === 'shared' ? sharedViewerItems.value : viewerItems.value
+    const item = items.find((candidate) => candidate.media.id === overlay.mediaId)
+    if (!item || navigationId !== archiveNavigationSequence) return
+    if (overlay.origin === 'shared') openSharedMedia(item.media as ArchiveSharedMediaItem, false)
+    else openMedia(item.media, false)
+    return
+  }
+  const entry = displayEntries.value.find((candidate) => candidate.items.some((item) => item.message_id === overlay.messageId))
+  if (!entry || navigationId !== archiveNavigationSequence) return
+  if (overlay.type === 'history') await openMessageHistory(entry, false)
+  else await openSenderProfile(entry, undefined, false)
+}
+
+function requestSharedMediaRange(start: number, end: number) {
+  if (end < start || sharedMediaTotal.value <= 0 || sharedMediaError.value) return
+  const firstPage = Math.floor(start / SHARED_MEDIA_PAGE_SIZE)
+  const lastPage = Math.floor(end / SHARED_MEDIA_PAGE_SIZE)
+  for (let page = firstPage; page <= lastPage; page += 1) {
+    if (!sharedMediaLoadedPages.has(page) && !sharedMediaPendingPages.has(page) && !sharedMediaFailedPages.has(page)) {
+      void fetchSharedMediaPage(page)
     }
   }
 }
 
-function switchSharedMediaTab(tab: SharedMediaTab) {
+function updateSharedMediaWindow() {
+  const metrics = sharedMediaScrollMetrics()
+  if (!metrics || sharedMediaTotal.value <= 0) {
+    sharedMediaWindow.value = { start: 0, end: -1 }
+    return
+  }
+  const layout = sharedMediaLayout()
+  const localTop = Math.max(0, metrics.content.scrollTop - metrics.virtualTop)
+  const buffer = metrics.content.clientHeight * SHARED_MEDIA_BUFFER_VIEWPORTS
+  const firstRow = Math.max(0, Math.floor((localTop - buffer) / layout.rowHeight))
+  const lastRow = Math.min(
+    Math.ceil(sharedMediaTotal.value / layout.columns) - 1,
+    Math.ceil((localTop + metrics.content.clientHeight + buffer) / layout.rowHeight),
+  )
+  const start = firstRow * layout.columns
+  const end = Math.min(sharedMediaTotal.value - 1, (lastRow + 1) * layout.columns - 1)
+  sharedMediaWindow.value = { start, end }
+  requestSharedMediaRange(start, end)
+}
+
+function updateSharedScrollbar() {
+  const metrics = sharedMediaScrollMetrics()
+  const scrollbar = sharedScrollbar.value
+  const thumb = sharedScrollbarThumb.value
+  if (!metrics || !scrollbar || !thumb || !metrics.mediaScrollable || sharedMediaTotal.value <= 0) {
+    sharedScrollbarVisible.value = false
+    sharedScrollbarBubbleVisible.value = false
+    return
+  }
+  sharedScrollbarVisible.value = metrics.tabsAreSticky || sharedScrollbarDragging.value
+  if (!sharedScrollbarVisible.value) {
+    sharedScrollbarBubbleVisible.value = false
+    return
+  }
+  const thumbHeight = thumb.offsetHeight || 42
+  const maxThumbTop = Math.max(1, scrollbar.clientHeight - thumbHeight)
+  const ratio = Math.max(0, Math.min(1, (metrics.content.scrollTop - metrics.mediaStart) / metrics.mediaRange))
+  const thumbTop = Math.round(ratio * maxThumbTop)
+  sharedScrollbarThumbTop.value = thumbTop
+  sharedScrollbarBubbleTop.value = thumbTop + thumbHeight / 2
+  const layout = sharedMediaLayout()
+  const current = Math.min(
+    sharedMediaTotal.value,
+    Math.max(1, Math.floor(Math.max(0, metrics.content.scrollTop - metrics.virtualTop) / layout.rowHeight) * layout.columns + 1),
+  )
+  sharedScrollbarLabel.value = `${current} / ${sharedMediaTotal.value}`
+}
+
+function scheduleSharedScrollbarUpdate() {
+  if (sharedScrollbarFrame) return
+  sharedScrollbarFrame = requestAnimationFrame(() => {
+    sharedScrollbarFrame = 0
+    updateSharedMediaWindow()
+    updateSharedScrollbar()
+  })
+}
+
+function showSharedScrollbarBubble(sticky = false) {
+  if (!sharedScrollbarVisible.value) return
+  sharedScrollbarBubbleVisible.value = true
+  if (sharedScrollbarBubbleTimer) window.clearTimeout(sharedScrollbarBubbleTimer)
+  if (!sticky) {
+    sharedScrollbarBubbleTimer = window.setTimeout(() => {
+      sharedScrollbarBubbleVisible.value = false
+    }, 850)
+  }
+}
+
+function handleSharedMediaScroll() {
+  scheduleSharedScrollbarUpdate()
+  scheduleArchiveSnapshot()
+  showSharedScrollbarBubble()
+}
+
+function setSharedScrollFromPointer(clientY: number) {
+  const content = infoScroll.value
+  const scrollbar = sharedScrollbar.value
+  const thumb = sharedScrollbarThumb.value
+  if (!content || !scrollbar || !thumb || !sharedScrollbarDrag) return
+  const metrics = sharedMediaScrollMetrics()
+  if (!metrics || !metrics.mediaScrollable) return
+  const rect = scrollbar.getBoundingClientRect()
+  const thumbHeight = thumb.offsetHeight || 42
+  const maxThumbTop = Math.max(1, rect.height - thumbHeight)
+  const thumbTop = Math.max(0, Math.min(maxThumbTop, clientY - rect.top - sharedScrollbarDrag.offsetY))
+  content.scrollTop = metrics.mediaStart + thumbTop / maxThumbTop * metrics.mediaRange
+  updateSharedMediaWindow()
+  updateSharedScrollbar()
+  showSharedScrollbarBubble(true)
+}
+
+function handleSharedScrollbarPointerDown(event: PointerEvent) {
+  const scrollbar = sharedScrollbar.value
+  const thumb = sharedScrollbarThumb.value
+  if (!scrollbar || !thumb) return
+  const thumbRect = thumb.getBoundingClientRect()
+  const offsetY = Math.max(0, Math.min(thumbRect.height, event.clientY - thumbRect.top))
+  sharedScrollbarDrag = { pointerId: event.pointerId, offsetY }
+  sharedScrollbarDragging.value = true
+  sharedScrollbarBubbleVisible.value = true
+  if (sharedScrollbarBubbleTimer) window.clearTimeout(sharedScrollbarBubbleTimer)
+  thumb.setPointerCapture(event.pointerId)
+  setSharedScrollFromPointer(event.clientY)
+  event.preventDefault()
+}
+
+function handleSharedScrollbarPointerMove(event: PointerEvent) {
+  if (!sharedScrollbarDrag || sharedScrollbarDrag.pointerId !== event.pointerId) return
+  setSharedScrollFromPointer(event.clientY)
+  event.preventDefault()
+}
+
+function endSharedScrollbarDrag(event?: PointerEvent) {
+  const thumb = sharedScrollbarThumb.value
+  if (!sharedScrollbarDrag || !thumb) return
+  const pointerId = sharedScrollbarDrag.pointerId
+  sharedScrollbarDrag = null
+  sharedScrollbarDragging.value = false
+  if (thumb.hasPointerCapture(pointerId)) thumb.releasePointerCapture(pointerId)
+  if (sharedScrollbarBubbleTimer) window.clearTimeout(sharedScrollbarBubbleTimer)
+  sharedScrollbarBubbleTimer = window.setTimeout(() => {
+    sharedScrollbarBubbleVisible.value = false
+  }, 650)
+  event?.preventDefault()
+}
+
+async function fetchSharedMediaPage(page: number) {
+  const chat = selected.value
+  if (!chat || page < 0 || sharedMediaLoadedPages.has(page) || sharedMediaPendingPages.has(page)) return
+  const requestId = sharedMediaRequestId
+  const pendingPages = sharedMediaPendingPages
+  pendingPages.add(page)
+  if (page === 0) sharedMediaLoading.value = true
+  else sharedMediaLoadingMore.value = true
+  try {
+    const kind = sharedMediaKinds.value.photo && sharedMediaKinds.value.video
+      ? 'all'
+      : sharedMediaKinds.value.photo ? 'photo' : 'video'
+    const filter = sharedMediaTab.value === 'media' ? `&media_filter=${kind}` : ''
+    const offset = page * SHARED_MEDIA_PAGE_SIZE
+    const result = await api<ArchiveSharedMediaPage>(`/api/archive/chats/${chat.peer_id}/shared-media?type=${sharedMediaTab.value}&limit=${SHARED_MEDIA_PAGE_SIZE}&offset=${offset}${filter}`)
+    if (requestId !== sharedMediaRequestId || selected.value?.peer_id !== chat.peer_id) return
+    const indexed = { ...sharedMediaByIndex.value }
+    result.items.forEach((item, index) => { indexed[offset + index] = item })
+    sharedMediaByIndex.value = indexed
+    sharedMediaTotal.value = result.total_count ?? Math.max(sharedMediaTotal.value, offset + result.items.length)
+    sharedMediaLoadedPages.add(page)
+    sharedMediaHasMore.value = Object.keys(indexed).length < sharedMediaTotal.value
+  } catch (value) {
+    if (requestId !== sharedMediaRequestId) return
+    sharedMediaFailedPages.add(page)
+    sharedMediaError.value = value instanceof Error ? value.message : '无法读取共享媒体'
+  } finally {
+    pendingPages.delete(page)
+    if (requestId === sharedMediaRequestId) {
+      if (page === 0) sharedMediaLoading.value = false
+      sharedMediaLoadingMore.value = [...sharedMediaPendingPages].some((pendingPage) => pendingPage > 0)
+      await nextTick()
+      updateSharedMediaWindow()
+      updateSharedScrollbar()
+    }
+  }
+}
+
+async function loadSharedMedia(append = false) {
+  if (append) {
+    const nextPage = Math.floor(sharedMediaItems.value.length / SHARED_MEDIA_PAGE_SIZE)
+    await fetchSharedMediaPage(nextPage)
+    return
+  }
+  sharedMediaRequestId += 1
+  sharedMediaLoadedPages = new Set<number>()
+  sharedMediaPendingPages = new Set<number>()
+  sharedMediaFailedPages = new Set<number>()
+  sharedMediaByIndex.value = {}
+  sharedMediaTotal.value = 0
+  sharedMediaWindow.value = { start: 0, end: -1 }
+  sharedMediaPosters.value = {}
+  sharedMediaError.value = ''
+  sharedMediaHasMore.value = false
+  await fetchSharedMediaPage(0)
+}
+
+async function switchSharedMediaTab(tab: SharedMediaTab) {
   if (sharedMediaTab.value === tab) return
+  sharedMediaScrollTops[sharedMediaTab.value] = infoScroll.value?.scrollTop || 0
   sharedMediaTab.value = tab
-  void loadSharedMedia(false)
+  await loadSharedMedia(false)
+  await nextTick()
+  const mediaTop = infoScroll.value?.querySelector<HTMLElement>('.archive-shared-media')?.offsetTop || 0
+  if (infoScroll.value) infoScroll.value.scrollTop = sharedMediaScrollTops[tab] ?? mediaTop
+  updateSharedScrollbar()
+  scheduleArchiveSnapshot()
 }
 
 function toggleSharedMediaKind(kind: 'photo' | 'video') {
   const current = sharedMediaKinds.value
   if (current[kind] && !current[kind === 'photo' ? 'video' : 'photo']) return
   sharedMediaKinds.value = { ...current, [kind]: !current[kind] }
-  void loadSharedMedia(false)
+  void loadSharedMedia(false).then(() => scheduleArchiveSnapshot())
 }
 
-async function openSharedContextMenu(item: ArchiveSharedMediaItem, event: MouseEvent) {
-  event.preventDefault()
+async function openSharedContextMenu(
+  item: ArchiveSharedMediaItem,
+  event: { clientX: number; clientY: number; preventDefault?: () => void },
+) {
+  event.preventDefault?.()
   const padding = 8
   const menuWidth = 176
   const menuHeight = 52
@@ -986,6 +1663,113 @@ async function openSharedContextMenu(item: ArchiveSharedMediaItem, event: MouseE
   }
   await nextTick()
   sharedContextMenuButton.value?.focus({ preventScroll: true })
+}
+
+function cancelSharedLongPress() {
+  if (sharedLongPressTimer) window.clearTimeout(sharedLongPressTimer)
+  sharedLongPressTimer = 0
+  sharedLongPress = null
+}
+
+function startSharedLongPress(item: ArchiveSharedMediaItem, event: PointerEvent, viewer = false) {
+  if (event.pointerType === 'mouse' || !event.isPrimary || event.button !== 0) return
+  cancelSharedLongPress()
+  sharedLongPress = {
+    item,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    viewer,
+  }
+  sharedLongPressTimer = window.setTimeout(() => {
+    const press = sharedLongPress
+    if (!press) return
+    sharedLongPressTimer = 0
+    sharedLongPressSuppression = { mediaId: press.item.id, expiresAt: performance.now() + 900 }
+    if (press.viewer) suppressViewerClick = true
+    void openSharedContextMenu(press.item, { clientX: press.startX, clientY: press.startY })
+  }, 520)
+}
+
+function moveSharedLongPress(event: PointerEvent) {
+  const press = sharedLongPress
+  if (!press || press.pointerId !== event.pointerId) return
+  if (Math.hypot(event.clientX - press.startX, event.clientY - press.startY) > 10) {
+    cancelSharedLongPress()
+  }
+}
+
+function endSharedLongPress(event: PointerEvent) {
+  if (sharedLongPress?.pointerId !== event.pointerId) return
+  cancelSharedLongPress()
+}
+
+function releaseViewerPointer(pointerId?: number) {
+  const origin = viewerDragOrigin
+  if (!origin || (pointerId !== undefined && origin.pointerId !== pointerId)) return
+  const stage = viewerStage.value
+  if (stage?.hasPointerCapture(origin.pointerId)) {
+    try { stage.releasePointerCapture(origin.pointerId) } catch { /* capture already ended */ }
+  }
+  if (origin.mode === 'swipe') {
+    const elapsed = Math.max(16, performance.now() - origin.startedAt)
+    const velocity = viewerSwipeX.value / elapsed * 1000
+    const threshold = Math.min(110, Math.max(54, window.innerWidth * .16))
+    const direction = viewerSwipeX.value < 0 ? 1 : -1
+    const canMove = viewerIndex.value !== null
+      && viewerIndex.value + direction >= 0
+      && viewerIndex.value + direction < activeViewerItems.value.length
+    if (canMove && (Math.abs(viewerSwipeX.value) >= threshold || Math.abs(velocity) >= 520)) {
+      moveViewer(direction)
+    } else {
+      viewerSwipeX.value = 0
+    }
+  } else {
+    viewerPan.value = clampViewerPan(viewerPan.value)
+  }
+  viewerDragOrigin = null
+  viewerDragging.value = false
+}
+
+function handleGlobalPointerEnd(event: PointerEvent) {
+  endSharedLongPress(event)
+  releaseViewerPointer(event.pointerId)
+  if (sharedScrollbarDrag?.pointerId === event.pointerId) endSharedScrollbarDrag()
+}
+
+function resetPointerInteractions() {
+  cancelSharedLongPress()
+  sharedLongPressSuppression = null
+  releaseViewerPointer()
+  endSharedScrollbarDrag()
+}
+
+function preventSharedNativeDrag(event: DragEvent) {
+  const target = event.target as HTMLElement | null
+  if (!target?.closest('.archive-shared-virtual-item, .archive-viewer-stage')) return
+  event.preventDefault()
+  resetPointerInteractions()
+}
+
+function sharedMediaItemAtEvent(event: Event) {
+  const target = event.target as HTMLElement | null
+  const item = target?.closest<HTMLElement>('[data-shared-index]')
+  const index = Number(item?.dataset.sharedIndex)
+  return Number.isInteger(index) ? sharedMediaByIndex.value[index] : undefined
+}
+
+function handleSharedLongPressPointerDown(event: PointerEvent) {
+  const item = sharedMediaItemAtEvent(event)
+  if (item) startSharedLongPress(item, event)
+}
+
+function consumeSharedLongPressActivation(event: MouseEvent) {
+  const item = sharedMediaItemAtEvent(event)
+  const suppression = sharedLongPressSuppression
+  if (!item || !suppression || suppression.mediaId !== item.id || performance.now() > suppression.expiresAt) return
+  sharedLongPressSuppression = null
+  event.preventDefault()
+  event.stopPropagation()
 }
 
 function closeSharedContextMenu() {
@@ -1000,8 +1784,19 @@ async function goToSharedMessage() {
   const messageId = sharedContextMenu.value?.item.message_id
   if (!messageId) return
   closeSharedContextMenu()
-  if (viewerIndex.value !== null) closeViewer()
-  infoOpen.value = false
+  if (isMobileArchive()) {
+    const navigationId = ++archiveNavigationSequence
+    flushArchiveSnapshot()
+    await jumpToMessage(messageId, true, false)
+    if (navigationId !== archiveNavigationSequence) return
+    mobileTransitionFrom.value = 'info'
+    mobileTransitionDirection.value = 'forward'
+    if (viewerIndex.value !== null) closeViewer(true)
+    infoOpen.value = false
+    writeArchiveRoute('thread', false, { thread: captureThreadSnapshot() || { messageId, offset: 0, atBottom: false } })
+    flushArchiveSnapshot()
+    return
+  }
   await jumpToMessage(messageId)
 }
 
@@ -1019,7 +1814,8 @@ function sharedMediaDomain(item: ArchiveSharedMediaItem) {
   try { return new URL(item.url).hostname.replace(/^www\./, '') } catch { return item.content?.site_name || '链接' }
 }
 
-function closeViewer() {
+function closeViewer(fromHistory = false) {
+  if (!fromHistory && popArchiveOverlay('viewer')) return
   viewerIndex.value = null
   resetViewerTransform()
   document.body.classList.remove('archive-viewer-open')
@@ -1036,6 +1832,7 @@ function moveViewer(direction: number) {
 function resetViewerTransform() {
   viewerZoom.value = 1
   viewerPan.value = { x: 0, y: 0 }
+  viewerSwipeX.value = 0
   viewerDragging.value = false
   viewerDragOrigin = null
 }
@@ -1096,37 +1893,47 @@ function handleViewerWheel(event: WheelEvent) {
 }
 
 function handleViewerPointerDown(event: PointerEvent) {
-  if (viewerZoom.value <= 1 || event.button !== 0) return
+  if (viewerOrigin.value === 'shared' && activeViewerItem.value) {
+    startSharedLongPress(activeViewerItem.value.media as ArchiveSharedMediaItem, event, true)
+  }
+  if (event.button !== 0 || !event.isPrimary) return
   const target = event.currentTarget as HTMLElement
   target.setPointerCapture(event.pointerId)
   viewerDragOrigin = {
     pointerId: event.pointerId,
     clientX: event.clientX,
     clientY: event.clientY,
+    startedAt: performance.now(),
     x: viewerPan.value.x,
     y: viewerPan.value.y,
+    mode: viewerZoom.value > 1 ? 'pan' : 'swipe',
   }
   suppressViewerClick = false
-  viewerDragging.value = true
   event.preventDefault()
 }
 
 function handleViewerPointerMove(event: PointerEvent) {
+  moveSharedLongPress(event)
   const origin = viewerDragOrigin
   if (!origin || origin.pointerId !== event.pointerId) return
   const deltaX = event.clientX - origin.clientX
   const deltaY = event.clientY - origin.clientY
-  if (Math.hypot(deltaX, deltaY) > 4) suppressViewerClick = true
-  viewerPan.value = clampViewerPan({ x: origin.x + deltaX, y: origin.y + deltaY })
+  if (Math.hypot(deltaX, deltaY) > 4) {
+    suppressViewerClick = true
+    viewerDragging.value = true
+  }
+  if (origin.mode === 'swipe') {
+    const atFirst = viewerIndex.value === 0 && deltaX > 0
+    const atLast = viewerIndex.value === activeViewerItems.value.length - 1 && deltaX < 0
+    viewerSwipeX.value = (atFirst || atLast) ? deltaX * .28 : deltaX
+  } else {
+    viewerPan.value = clampViewerPan({ x: origin.x + deltaX, y: origin.y + deltaY })
+  }
 }
 
 function handleViewerPointerUp(event: PointerEvent) {
-  if (!viewerDragOrigin || viewerDragOrigin.pointerId !== event.pointerId) return
-  const target = event.currentTarget as HTMLElement
-  if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId)
-  viewerPan.value = clampViewerPan(viewerPan.value)
-  viewerDragOrigin = null
-  viewerDragging.value = false
+  endSharedLongPress(event)
+  releaseViewerPointer(event.pointerId)
 }
 
 function handleViewerStageClick(event: MouseEvent) {
@@ -1140,8 +1947,9 @@ function handleViewerStageClick(event: MouseEvent) {
 }
 
 function viewerMediaStyle() {
+  const translateX = viewerZoom.value === 1 ? viewerSwipeX.value : viewerPan.value.x
   return {
-    transform: `translate3d(${viewerPan.value.x.toFixed(2)}px, ${viewerPan.value.y.toFixed(2)}px, 0) scale(${viewerZoom.value})`,
+    transform: `translate3d(${translateX.toFixed(2)}px, ${viewerPan.value.y.toFixed(2)}px, 0) scale(${viewerZoom.value})`,
   }
 }
 
@@ -1181,8 +1989,8 @@ function entriesJoin(left: ArchiveEntry | undefined, right: ArchiveEntry | undef
   if (entryButtons(left).length || entryButtons(right).length) return false
   if (entryIsDeleted(left) || entryIsDeleted(right)) return false
   if (dateKey(left.last.sent_at) !== dateKey(right.first.sent_at)) return false
-  const leftAt = left.last.sent_at ? new Date(left.last.sent_at).getTime() : Number.NaN
-  const rightAt = right.first.sent_at ? new Date(right.first.sent_at).getTime() : Number.NaN
+  const leftAt = left.last.sent_at ? serverDate(left.last.sent_at).getTime() : Number.NaN
+  const rightAt = right.first.sent_at ? serverDate(right.first.sent_at).getTime() : Number.NaN
   return Number.isFinite(leftAt) && Number.isFinite(rightAt)
     && rightAt >= leftAt && rightAt - leftAt <= 10 * 60 * 1000
 }
@@ -1224,9 +2032,140 @@ function showEntryAvatar(index: number, entry: ArchiveEntry) {
   return groupShowsSender() && !entry.first.out && !joinsNext(index)
 }
 
-async function jumpToMessage(messageId: number) {
+function messageSearchSnippet(item: ArchiveMessageSearchItem) {
+  const text = (item.text || '').replace(/\s+/g, ' ').trim()
+  const query = messageSearchQuery.value.trim()
+  const index = text.toLocaleLowerCase().indexOf(query.toLocaleLowerCase())
+  if (!query || index < 0) return { before: text.slice(0, 150), match: '', after: text.length > 150 ? '…' : '' }
+  const start = Math.max(0, index - 55)
+  const end = Math.min(text.length, index + query.length + 80)
+  return {
+    before: `${start ? '…' : ''}${text.slice(start, index)}`,
+    match: text.slice(index, index + query.length),
+    after: `${text.slice(index + query.length, end)}${end < text.length ? '…' : ''}`,
+  }
+}
+
+async function goToMessageSearchResult(index: number) {
+  if (index < 0) return
+  if (index >= messageSearchResults.value.length && messageSearchResults.value.length < messageSearchTotal.value) {
+    await runMessageSearch(true)
+  }
+  const result = messageSearchResults.value[index]
+  if (!result) return
+  messageSearchActiveIndex.value = index
+  await nextTick()
+  document
+    .querySelector<HTMLElement>('.archive-message-search-results > button.active')
+    ?.scrollIntoView({ block: 'nearest' })
+  await jumpToMessage(result.message_id)
+}
+
+async function runMessageSearch(append = false) {
+  const chat = selected.value
+  const query = messageSearchQuery.value.trim()
+  if (!chat || !query) {
+    messageSearchResults.value = []
+    messageSearchTotal.value = 0
+    messageSearchActiveIndex.value = -1
+    messageSearchError.value = ''
+    return
+  }
+  if (append && (messageSearchLoadingMore.value || messageSearchResults.value.length >= messageSearchTotal.value)) return
+  const requestId = append ? messageSearchRequestId : ++messageSearchRequestId
+  if (append) messageSearchLoadingMore.value = true
+  else {
+    messageSearchLoading.value = true
+    messageSearchResults.value = []
+    messageSearchTotal.value = 0
+    messageSearchActiveIndex.value = -1
+  }
+  messageSearchError.value = ''
+  try {
+    const offset = append ? messageSearchResults.value.length : 0
+    const result = await api<ArchiveMessageSearchPage>(
+      `/api/archive/chats/${chat.peer_id}/search?q=${encodeURIComponent(query)}&offset=${offset}&limit=42`,
+    )
+    if (requestId !== messageSearchRequestId || selected.value?.peer_id !== chat.peer_id || messageSearchQuery.value.trim() !== query) return
+    messageSearchResults.value = append ? [...messageSearchResults.value, ...result.items] : result.items
+    messageSearchTotal.value = result.total_count
+    if (!append && result.items.length) await goToMessageSearchResult(0)
+  } catch (value) {
+    if (requestId !== messageSearchRequestId) return
+    messageSearchError.value = value instanceof Error ? value.message : '无法搜索消息'
+  } finally {
+    if (requestId === messageSearchRequestId) {
+      messageSearchLoading.value = false
+      messageSearchLoadingMore.value = false
+    }
+  }
+}
+
+function scheduleMessageSearch() {
+  if (messageSearchTimer) window.clearTimeout(messageSearchTimer)
+  if (!messageSearchQuery.value.trim()) {
+    messageSearchRequestId += 1
+    messageSearchResults.value = []
+    messageSearchTotal.value = 0
+    messageSearchActiveIndex.value = -1
+    messageSearchLoading.value = false
+    messageSearchError.value = ''
+    return
+  }
+  messageSearchTimer = window.setTimeout(() => void runMessageSearch(false), 260)
+}
+
+async function openMessageSearch(recordHistory = true) {
+  if (recordHistory) pushArchiveOverlay({ type: 'search', query: messageSearchQuery.value })
+  messageSearchOpen.value = true
+  infoOpen.value = false
+  await nextTick()
+  messageSearchInput.value?.focus()
+}
+
+function closeMessageSearch(fromHistory = false) {
+  if (!fromHistory && popArchiveOverlay('search')) return
+  if (messageSearchTimer) window.clearTimeout(messageSearchTimer)
+  messageSearchRequestId += 1
+  messageSearchOpen.value = false
+  messageSearchQuery.value = ''
+  messageSearchResults.value = []
+  messageSearchTotal.value = 0
+  messageSearchActiveIndex.value = -1
+  messageSearchLoading.value = false
+  messageSearchLoadingMore.value = false
+  messageSearchError.value = ''
+}
+
+function handleMessageSearchKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    closeMessageSearch()
+  } else if (event.key === 'Enter') {
+    event.preventDefault()
+    if (messageSearchActiveIndex.value >= 0) void goToMessageSearchResult(messageSearchActiveIndex.value)
+    else void runMessageSearch(false)
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    void goToMessageSearchResult(messageSearchActiveIndex.value + 1)
+  } else if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    void goToMessageSearchResult(messageSearchActiveIndex.value - 1)
+  }
+}
+
+function handleMessageSearchResultsScroll(event: Event) {
+  const target = event.currentTarget as HTMLElement
+  if (target.scrollHeight - target.scrollTop - target.clientHeight < 120
+    && messageSearchResults.value.length < messageSearchTotal.value) {
+    void runMessageSearch(true)
+  }
+}
+
+async function jumpToMessage(messageId: number, highlight = true, smooth = highlight) {
   if (!selected.value || loadingMessages.value) return
   const existing = messages.value.some((message) => message.message_id === messageId)
+  if (!smooth) messagePositionReady.value = false
   if (!existing) {
     loadingMessages.value = true
     messagePositionReady.value = false
@@ -1259,14 +2198,34 @@ async function jumpToMessage(messageId: number) {
     return
   }
   const target = document.getElementById(`archive-${entry.key}`)
-  target?.scrollIntoView({ block: 'center', behavior: existing ? 'smooth' : 'auto' })
+  const viewport = messageViewport.value
+  if (target && viewport) {
+    const centerTarget = () => {
+      const viewportRect = viewport.getBoundingClientRect()
+      const targetRect = target.getBoundingClientRect()
+      const centeredTop = viewport.scrollTop
+        + targetRect.top - viewportRect.top
+        - (viewport.clientHeight - targetRect.height) / 2
+      viewport.scrollTo({
+        top: Math.max(0, Math.min(centeredTop, viewport.scrollHeight - viewport.clientHeight)),
+        behavior: smooth && existing ? 'smooth' : 'auto',
+      })
+    }
+    centerTarget()
+    if (!smooth) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      centerTarget()
+    }
+  }
   messagePositionReady.value = true
-  target?.classList.add('is-highlighted')
-  window.setTimeout(() => target?.classList.remove('is-highlighted'), 1400)
+  if (highlight) {
+    target?.classList.add('is-highlighted')
+    window.setTimeout(() => target?.classList.remove('is-highlighted'), 1400)
+  }
 }
 
 function applyPageState(result: ArchiveMessagePage) {
-  hasOlder.value = result.has_older ?? result.has_more
+  hasOlder.value = result.has_older
   hasNewer.value = result.has_newer ?? false
   nextBeforeId.value = result.next_before_id || null
   nextAfterId.value = result.next_after_id || null
@@ -1278,19 +2237,59 @@ function mergeMessages(items: ArchiveMessage[]) {
   return [...byId.values()].sort((left, right) => left.message_id - right.message_id)
 }
 
-function visibleScrollAnchor() {
+interface MessageScrollAnchor {
+  elementId: string
+  messageId: number | null
+  top: number
+  scrollTop: number
+  scrollHeight: number
+}
+
+function visibleScrollAnchor(): MessageScrollAnchor | null {
   const viewport = messageViewport.value
   if (!viewport) return null
   const elements = [...viewport.querySelectorAll<HTMLElement>('.archive-message-line')]
   const element = elements.find((candidate) => candidate.getBoundingClientRect().bottom >= viewport.getBoundingClientRect().top)
-  return element ? { id: element.id, top: element.getBoundingClientRect().top } : null
+  if (!element) return null
+  const firstMessageId = Number(element.dataset.messageIds?.split(' ')[0])
+  return {
+    elementId: element.id,
+    messageId: Number.isFinite(firstMessageId) ? firstMessageId : null,
+    top: element.getBoundingClientRect().top,
+    scrollTop: viewport.scrollTop,
+    scrollHeight: viewport.scrollHeight,
+  }
 }
 
-function restoreScrollAnchor(anchor: { id: string; top: number } | null) {
+function restoreScrollAnchor(anchor: MessageScrollAnchor | null) {
   const viewport = messageViewport.value
-  const element = anchor ? document.getElementById(anchor.id) : null
-  if (viewport && element) viewport.scrollTop += element.getBoundingClientRect().top - anchor!.top
+  if (!viewport || !anchor) return
+  // Prepending can complete an album whose Vue key is based on its former
+  // first message. Fall back to a stable Telegram message id when that makes
+  // the old DOM id disappear.
+  const element = document.getElementById(anchor.elementId)
+    || (anchor.messageId === null
+      ? null
+      : viewport.querySelector<HTMLElement>(`[data-message-ids~="${anchor.messageId}"]`))
+  if (element) {
+    viewport.scrollTop += element.getBoundingClientRect().top - anchor.top
+  } else {
+    // A line may still be replaced by regrouping or filtering. Preserving the
+    // inserted height is safer than leaving scrollTop at zero.
+    viewport.scrollTop = anchor.scrollTop + viewport.scrollHeight - anchor.scrollHeight
+  }
   updateStickyDate()
+}
+
+async function stabilizeScrollAnchor(anchor: MessageScrollAnchor | null) {
+  restoreScrollAnchor(anchor)
+  if (!anchor) return
+  // Cached thumbnails and child components can settle one or two frames after
+  // Vue's nextTick. Reapply the same stable anchor before unlocking loading.
+  for (let frame = 0; frame < 2; frame += 1) {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    restoreScrollAnchor(anchor)
+  }
 }
 
 function nearBottom() {
@@ -1334,12 +2333,37 @@ async function loadChats() {
   try {
     const result = await api<{ items: ArchiveChat[] }>('/api/archive/chats')
     chats.value = result.items
+    const mobileRoute = archiveRouteFromLocation()
     if (selected.value) {
       selected.value = result.items.find((item) => item.peer_id === selected.value?.peer_id) || null
     }
     if (!selected.value && result.items.length) {
-      selected.value = result.items[0]
+      selected.value = result.items.find((item) => item.peer_id === mobileRoute.peerId) || result.items[0]
       await Promise.all([loadMessages(false), loadSharedMedia(false)])
+    }
+    if (isMobileArchive()) {
+      const routeMatchesSelection = mobileRoute.peerId !== null && mobileRoute.peerId === selected.value?.peer_id
+      mobileThreadOpen.value = routeMatchesSelection && mobileRoute.layer !== 'list'
+      infoOpen.value = routeMatchesSelection && mobileRoute.layer === 'info'
+      if (mobileRoute.peerId !== null && !routeMatchesSelection) {
+        writeArchiveRoute('list', true)
+      } else {
+        const layer = routeMatchesSelection ? mobileRoute.layer : 'list'
+        ensureArchiveHistoryFrame(layer, routeMatchesSelection ? mobileRoute.peerId : null)
+        const frame = currentArchiveFrame()
+        lastAppliedArchiveEntry = frame?.entryId || ''
+        activeArchiveStackIndex = frame?.stackIndex ?? 0
+        if (layer === 'info') {
+          await nextTick()
+          await restoreInfoSnapshot(frame?.info)
+        } else if (layer === 'thread') {
+          await nextTick()
+          await restoreThreadSnapshot(frame?.thread)
+        } else {
+          await restoreListSnapshot(frame?.list)
+        }
+        await restoreArchiveOverlay(frame?.overlay, archiveNavigationSequence)
+      }
     }
   } catch (value) {
     error.value = value instanceof Error ? value.message : '无法读取聊天记录'
@@ -1352,8 +2376,15 @@ async function loadMessages(prepend: boolean) {
   const chat = selected.value
   if (!chat || (prepend ? loadingOlder.value : loadingMessages.value)) return
   const anchor = prepend ? visibleScrollAnchor() : null
-  if (prepend) loadingOlder.value = true
+  if (prepend) {
+    // Keep this lock after the request finishes. Residual wheel events from
+    // the same gesture must not immediately request another page when the
+    // scroll anchor is restored.
+    olderLoadNeedsFreshGesture = true
+    loadingOlder.value = true
+  }
   else {
+    olderLoadNeedsFreshGesture = false
     loadingMessages.value = true
     messagePositionReady.value = false
   }
@@ -1366,7 +2397,7 @@ async function loadMessages(prepend: boolean) {
     if (selected.value?.peer_id !== chat.peer_id) return
     messages.value = prepend ? mergeMessages(result.items) : result.items
     if (prepend) {
-      hasOlder.value = result.has_older ?? result.has_more
+      hasOlder.value = result.has_older
       nextBeforeId.value = result.next_before_id || null
       if (messages.value.length > MESSAGE_WINDOW_LIMIT) {
         messages.value = messages.value.slice(0, MESSAGE_WINDOW_LIMIT)
@@ -1382,7 +2413,7 @@ async function loadMessages(prepend: boolean) {
     if (!prepend) loadingMessages.value = false
     await nextTick()
     if (prepend) {
-      restoreScrollAnchor(anchor)
+      await stabilizeScrollAnchor(anchor)
     } else if (!prepend) {
       await scrollToBottom()
       messagePositionReady.value = true
@@ -1436,17 +2467,143 @@ async function handleNewMessages() {
   else await scrollToBottom(true)
 }
 
-async function selectChat(chat: ArchiveChat) {
-  if (selected.value?.peer_id === chat.peer_id) {
-    mobileThreadOpen.value = true
-    if (window.innerWidth <= 760) infoOpen.value = false
-    await scrollToBottom()
+async function toggleInfoPane() {
+  if (!isMobileArchive()) {
+    infoOpen.value = !infoOpen.value
     return
   }
+  if (infoOpen.value) {
+    closeInfoPane()
+    return
+  }
+  const navigationId = ++archiveNavigationSequence
+  flushArchiveSnapshot()
+  const snapshot = freshInfoSnapshot()
+  await restoreInfoSnapshot(snapshot, navigationId)
+  if (navigationId !== archiveNavigationSequence) return
+  mobileTransitionFrom.value = 'thread'
+  mobileTransitionDirection.value = 'forward'
+  infoOpen.value = true
+  writeArchiveRoute('info', false, { info: cloneInfoSnapshot(snapshot) })
+  await restoreInfoSnapshot(snapshot, navigationId)
+}
+
+function closeInfoPane() {
+  if (!isMobileArchive()) {
+    infoOpen.value = false
+    return
+  }
+  ++archiveNavigationSequence
+  flushArchiveSnapshot()
+  const frame = currentArchiveFrame()
+  if (frame?.layer === 'info' && frame.stackIndex > 0) {
+    window.history.back()
+    return
+  }
+  mobileTransitionFrom.value = 'info'
+  mobileTransitionDirection.value = 'back'
+  infoOpen.value = false
+  writeArchiveRoute('thread', true, { thread: captureThreadSnapshot() || undefined })
+}
+
+function closeMobileThread() {
+  if (messageSearchOpen.value) {
+    closeMessageSearch()
+    return
+  }
+  if (!isMobileArchive()) {
+    mobileThreadOpen.value = false
+    return
+  }
+  ++archiveNavigationSequence
+  flushArchiveSnapshot()
+  const frame = currentArchiveFrame()
+  if (frame?.layer === 'thread' && frame.stackIndex > 0) {
+    window.history.back()
+    return
+  }
+  infoOpen.value = false
+  mobileTransitionFrom.value = 'thread'
+  mobileTransitionDirection.value = 'back'
+  mobileNavigationDirection.value = 'back'
+  mobileThreadOpen.value = false
+  writeArchiveRoute('list', true)
+}
+
+async function syncArchiveRouteFromLocation() {
+  if (!isMobileArchive() || !window.location.hash.startsWith('#/archive')) return
+  const route = archiveRouteFromLocation()
+  const frame = currentArchiveFrame()
+  const entryKey = frame?.entryId || `${window.location.hash}:${frame?.stackIndex ?? 'direct'}`
+  if (entryKey === lastAppliedArchiveEntry) return
+  const navigationId = ++archiveNavigationSequence
+  const fromLayer: ArchiveMobileLayer = infoOpen.value ? 'info' : mobileThreadOpen.value ? 'thread' : 'list'
+  const targetStackIndex = frame?.stackIndex ?? activeArchiveStackIndex
+  const direction: 'forward' | 'back' = targetStackIndex < activeArchiveStackIndex ? 'back' : 'forward'
+  mobileTransitionFrom.value = fromLayer
+  mobileTransitionDirection.value = direction
+  mobileNavigationDirection.value = direction
+  activeArchiveStackIndex = targetStackIndex
+  lastAppliedArchiveEntry = entryKey
+  if (route.layer === 'list') {
+    await restoreListSnapshot(frame?.list, navigationId)
+    if (navigationId !== archiveNavigationSequence) return
+    closeActiveArchiveOverlay()
+    infoOpen.value = false
+    if (mobileThreadOpen.value) mobileNavigationDirection.value = 'back'
+    mobileThreadOpen.value = false
+    return
+  }
+  const chat = chats.value.find((item) => item.peer_id === route.peerId)
+  if (!chat) return
+  if (selected.value?.peer_id !== chat.peer_id) await selectChat(chat, false)
+  if (navigationId !== archiveNavigationSequence) return
+  if (route.layer === 'info') {
+    const snapshot = frame?.info
+    await restoreInfoSnapshot(snapshot, navigationId)
+    if (navigationId !== archiveNavigationSequence) return
+    mobileThreadOpen.value = true
+    infoOpen.value = true
+    await nextTick()
+    await restoreInfoSnapshot(snapshot, navigationId)
+  } else {
+    await restoreThreadSnapshot(frame?.thread, navigationId)
+    if (navigationId !== archiveNavigationSequence) return
+    mobileThreadOpen.value = true
+    infoOpen.value = false
+  }
+  if (navigationId !== archiveNavigationSequence) return
+  closeActiveArchiveOverlay()
+  await restoreArchiveOverlay(frame?.overlay, navigationId)
+}
+
+async function selectChat(chat: ArchiveChat, updateMobileRoute = true) {
+  if (updateMobileRoute) flushArchiveSnapshot()
+  if (isMobileArchive() && updateMobileRoute) {
+    ++archiveNavigationSequence
+    mobileNavigationDirection.value = 'forward'
+    mobileTransitionDirection.value = 'forward'
+    mobileTransitionFrom.value = mobileThreadOpen.value ? 'thread' : 'list'
+  }
+  if (selected.value?.peer_id === chat.peer_id) {
+    if (updateMobileRoute || !isMobileArchive()) {
+      mobileThreadOpen.value = true
+      if (window.innerWidth <= 760) infoOpen.value = false
+    }
+    if (updateMobileRoute && isMobileArchive()) writeArchiveRoute('thread')
+    await scrollToBottom()
+    if (updateMobileRoute) flushArchiveSnapshot()
+    return
+  }
+  closeMessageSearch(true)
   selected.value = chat
-  closeSenderProfile()
-  mobileThreadOpen.value = true
-  infoOpen.value = window.innerWidth > 760
+  for (const tab of sharedMediaTabs) delete sharedMediaScrollTops[tab.type]
+  closeSenderProfile(true)
+  if (updateMobileRoute || !isMobileArchive()) {
+    mobileThreadOpen.value = true
+    infoOpen.value = window.innerWidth > 760
+  }
+  if (updateMobileRoute && isMobileArchive()) writeArchiveRoute('thread')
   messages.value = []
   hasOlder.value = false
   hasNewer.value = false
@@ -1455,16 +2612,41 @@ async function selectChat(chat: ArchiveChat) {
   newMessageCount.value = 0
   stickyDateLabel.value = ''
   await Promise.all([loadMessages(false), loadSharedMedia(false)])
+  if (updateMobileRoute) flushArchiveSnapshot()
 }
 
 function handleMessageScroll() {
   const viewport = messageViewport.value
   if (!viewport) return
   updateStickyDate()
-  if (viewport.scrollTop < 120 && hasOlder.value && !loadingOlder.value) loadMessages(true)
-  if (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120
-    && hasNewer.value && !loadingNewer.value) loadNewerMessages()
+  if (messagePositionReady.value) {
+    if (viewport.scrollTop < 120 && hasOlder.value && !loadingOlder.value && !olderLoadNeedsFreshGesture) loadMessages(true)
+    if (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 120
+      && hasNewer.value && !loadingNewer.value) loadNewerMessages()
+  }
   if (nearBottom()) newMessageCount.value = 0
+  scheduleArchiveSnapshot()
+}
+
+function handleMessageWheel(event: WheelEvent) {
+  if (event.deltaY >= 0) return
+  const now = performance.now()
+  const startsFreshGesture = now - lastUpwardWheelAt > WHEEL_GESTURE_IDLE_MS
+  lastUpwardWheelAt = now
+  if (startsFreshGesture && olderLoadNeedsFreshGesture && !loadingOlder.value) {
+    olderLoadNeedsFreshGesture = false
+  }
+}
+
+function handleMessagePointerDown() {
+  if (!loadingOlder.value) olderLoadNeedsFreshGesture = false
+}
+
+function handleMessageNavigationKey(event: KeyboardEvent) {
+  if (!['ArrowUp', 'PageUp', 'Home'].includes(event.key)) return
+  const target = event.target as HTMLElement | null
+  if (target?.matches('input, textarea, [contenteditable="true"]')) return
+  if (!loadingOlder.value) olderLoadNeedsFreshGesture = false
 }
 
 async function syncCurrentChat() {
@@ -1512,32 +2694,74 @@ watch(alwaysShowSpoilers, (value) => {
   window.localStorage.setItem('tg-backup-always-show-spoilers', String(value))
 })
 
+watch(query, scheduleArchiveSnapshot)
+
 watch(infoOpen, (value) => {
   if (value && selected.value && !sharedMediaItems.value.length && !sharedMediaLoading.value) void loadSharedMedia(false)
 })
 
+watch(mobileThreadOpen, (value) => {
+  emit('mobile-detail-change', value)
+}, { immediate: true })
+
+watch(() => [infoOpen.value, selected.value?.peer_id], async () => {
+  await nextTick()
+  infoScrollObserver?.disconnect()
+  if (infoScroll.value) infoScrollObserver?.observe(infoScroll.value)
+  updateSharedScrollbar()
+})
+
+watch(sharedMediaItems, () => {
+  void nextTick(scheduleSharedScrollbarUpdate)
+}, { flush: 'post' })
+
 onMounted(() => {
+  window.addEventListener('popstate', syncArchiveRouteFromLocation)
+  window.addEventListener('hashchange', syncArchiveRouteFromLocation)
   window.addEventListener('tg-realtime-event', handleRealtimeEvent)
   window.addEventListener('keydown', handleViewerKeydown)
+  window.addEventListener('keydown', handleMessageNavigationKey)
   document.addEventListener('visibilitychange', handleDocumentVisibility)
   document.addEventListener('pointerdown', handleSharedContextPointerDown)
+  window.addEventListener('pointermove', moveSharedLongPress, true)
+  window.addEventListener('pointerup', handleGlobalPointerEnd, true)
+  window.addEventListener('pointercancel', handleGlobalPointerEnd, true)
+  window.addEventListener('blur', resetPointerInteractions)
+  document.addEventListener('dragstart', preventSharedNativeDrag, true)
   document.addEventListener('scroll', closeSharedContextMenu, true)
   window.addEventListener('resize', closeSharedContextMenu)
   viewportObserver = new ResizeObserver(([entry]) => {
     messageViewportWidth.value = entry.contentRect.width
   })
+  infoScrollObserver = new ResizeObserver(scheduleSharedScrollbarUpdate)
   if (messageViewport.value) viewportObserver.observe(messageViewport.value)
   loadChats()
 })
 onBeforeUnmount(() => {
+  flushArchiveSnapshot()
+  emit('mobile-detail-change', false)
+  window.removeEventListener('popstate', syncArchiveRouteFromLocation)
+  window.removeEventListener('hashchange', syncArchiveRouteFromLocation)
   window.removeEventListener('tg-realtime-event', handleRealtimeEvent)
   window.removeEventListener('keydown', handleViewerKeydown)
+  window.removeEventListener('keydown', handleMessageNavigationKey)
   document.removeEventListener('visibilitychange', handleDocumentVisibility)
   document.removeEventListener('pointerdown', handleSharedContextPointerDown)
+  window.removeEventListener('pointermove', moveSharedLongPress, true)
+  window.removeEventListener('pointerup', handleGlobalPointerEnd, true)
+  window.removeEventListener('pointercancel', handleGlobalPointerEnd, true)
+  window.removeEventListener('blur', resetPointerInteractions)
+  document.removeEventListener('dragstart', preventSharedNativeDrag, true)
   document.removeEventListener('scroll', closeSharedContextMenu, true)
   window.removeEventListener('resize', closeSharedContextMenu)
   viewportObserver?.disconnect()
+  infoScrollObserver?.disconnect()
   inlineVideoObserver?.disconnect()
+  if (sharedScrollbarFrame) cancelAnimationFrame(sharedScrollbarFrame)
+  if (archiveSnapshotTimer) window.clearTimeout(archiveSnapshotTimer)
+  if (sharedScrollbarBubbleTimer) window.clearTimeout(sharedScrollbarBubbleTimer)
+  cancelSharedLongPress()
+  if (messageSearchTimer) window.clearTimeout(messageSearchTimer)
   visibleInlineVideos.forEach((video) => video.pause())
   visibleInlineVideos.clear()
   document.body.classList.remove('archive-viewer-open')
@@ -1545,7 +2769,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div :class="['archive-layout', { 'mobile-thread-open': mobileThreadOpen, 'info-open': Boolean(selected && infoOpen) }]">
+  <div :class="['archive-layout', `mobile-transition-${mobileTransitionDirection}`, `mobile-from-${mobileTransitionFrom}`, { 'mobile-thread-open': mobileThreadOpen, 'mobile-nav-forward': mobileNavigationDirection === 'forward', 'mobile-nav-back': mobileNavigationDirection === 'back', 'info-open': Boolean(selected && infoOpen) }]">
     <aside class="archive-chat-pane" aria-label="已备份会话">
       <header class="archive-list-header">
         <div><p class="eyebrow">聊天记录</p><h1>消息</h1></div>
@@ -1558,7 +2782,7 @@ onBeforeUnmount(() => {
       <div v-if="loadingChats" class="archive-loading"><span class="spinner small"></span>正在读取</div>
       <div v-else-if="error && !chats.length" class="archive-empty"><strong>无法读取聊天记录</strong><span>{{ error }}</span><button class="button secondary compact" @click="loadChats">重试</button></div>
       <div v-else-if="!chats.length" class="archive-empty"><strong>还没有已备份消息</strong><span>为会话创建规则并完成一次备份后，消息会出现在这里。</span></div>
-      <div v-else class="archive-chat-list">
+      <div v-else ref="chatList" class="archive-chat-list" @scroll.passive="scheduleArchiveSnapshot">
         <button v-for="chat in filteredChats" :key="chat.peer_id" :class="['archive-chat-item', { active: selected?.peer_id === chat.peer_id }]" @click="selectChat(chat)">
           <span :class="['chat-avatar', { 'saved-messages-avatar': chat.is_self }]" :style="avatarHue(chat.peer_id)">
             <SavedMessagesIcon v-if="chat.is_self" />
@@ -1576,17 +2800,46 @@ onBeforeUnmount(() => {
 
     <main v-if="selected" class="archive-message-pane">
       <header class="archive-thread-header">
-        <button class="archive-back" aria-label="返回会话列表" @click="mobileThreadOpen = false"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" /></svg></button>
+        <button class="archive-back" aria-label="返回上一层" @click="closeMobileThread"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" /></svg></button>
         <span :class="['chat-avatar', 'thread-avatar', { 'saved-messages-avatar': selected.is_self }]" :style="avatarHue(selected.peer_id)">
           <SavedMessagesIcon v-if="selected.is_self" />
           <img v-else-if="selected.avatar_url" :src="selected.avatar_url" :alt="`${selected.title}头像`" />
           <template v-else>{{ avatarText(selected) }}</template>
         </span>
         <div class="archive-thread-title"><strong>{{ selected.title }}</strong><span>{{ selected.message_count }} 条已备份消息 · {{ ruleStatusLabel[selected.rule_status] }}</span></div>
-        <button :class="['archive-icon-button', { active: infoOpen }]" aria-label="会话信息" @click="infoOpen = !infoOpen"><svg viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Zm0-11v6m0-10v.1" /></svg></button>
+        <button class="archive-icon-button" aria-label="搜索消息" title="搜索消息" @click="openMessageSearch()"><svg viewBox="0 0 24 24"><path d="m20.7 19.3-4.1-4.1a7.5 7.5 0 1 0-1.4 1.4l4.1 4.1 1.4-1.4ZM5 11a6 6 0 1 1 12 0 6 6 0 0 1-12 0Z" /></svg></button>
+        <button :class="['archive-icon-button', { active: infoOpen }]" aria-label="会话信息" @click="toggleInfoPane"><svg viewBox="0 0 24 24"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Zm0-11v6m0-10v.1" /></svg></button>
       </header>
 
-      <div ref="messageViewport" class="archive-message-viewport" @scroll.passive="handleMessageScroll">
+      <section v-if="messageSearchOpen" class="archive-message-search" aria-label="搜索消息">
+        <header>
+          <button aria-label="关闭搜索" title="关闭搜索" @click="closeMessageSearch()"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" /></svg></button>
+          <label>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.7 19.3-4.1-4.1a7.5 7.5 0 1 0-1.4 1.4l4.1 4.1 1.4-1.4ZM5 11a6 6 0 1 1 12 0 6 6 0 0 1-12 0Z" /></svg>
+            <input ref="messageSearchInput" v-model="messageSearchQuery" type="search" aria-label="搜索当前会话消息" placeholder="搜索" autocomplete="off" @input="scheduleMessageSearch" @keydown="handleMessageSearchKeydown" />
+            <span v-if="messageSearchLoading" class="spinner small"></span>
+            <button v-else-if="messageSearchQuery" type="button" aria-label="清除搜索" title="清除" @click="messageSearchQuery = ''; scheduleMessageSearch(); messageSearchInput?.focus()"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17" /></svg></button>
+          </label>
+          <span class="archive-message-search-count" aria-live="polite">{{ messageSearchTotal ? `${Math.max(1, messageSearchActiveIndex + 1)} / ${messageSearchTotal}` : messageSearchQuery && !messageSearchLoading ? '无结果' : '' }}</span>
+          <button aria-label="较旧的结果" title="较旧的结果" :disabled="messageSearchActiveIndex < 0 || messageSearchActiveIndex + 1 >= messageSearchTotal" @click="goToMessageSearchResult(messageSearchActiveIndex + 1)"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg></button>
+          <button aria-label="较新的结果" title="较新的结果" :disabled="messageSearchActiveIndex <= 0" @click="goToMessageSearchResult(messageSearchActiveIndex - 1)"><svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6" /></svg></button>
+        </header>
+        <div v-if="messageSearchQuery" class="archive-message-search-dropdown">
+          <div v-if="messageSearchError" class="archive-message-search-state error"><span>{{ messageSearchError }}</span><button @click="runMessageSearch(false)">重试</button></div>
+          <div v-else-if="messageSearchLoading" class="archive-message-search-state"><span class="spinner small"></span><span>正在搜索</span></div>
+          <div v-else-if="!messageSearchResults.length" class="archive-message-search-state">没有找到匹配的消息</div>
+          <div v-else class="archive-message-search-results" @scroll.passive="handleMessageSearchResultsScroll">
+            <button v-for="(result, resultIndex) in messageSearchResults" :key="result.message_id" :class="{ active: resultIndex === messageSearchActiveIndex }" @click="goToMessageSearchResult(resultIndex)">
+              <span><strong>{{ result.sender_name || (selected.is_self ? '我' : selected.title) }}</strong><time>{{ formatListTime(result.sent_at) }}</time></span>
+              <small><template v-for="(part, partIndex) in [messageSearchSnippet(result)]" :key="partIndex">{{ part.before }}<mark v-if="part.match">{{ part.match }}</mark>{{ part.after }}</template></small>
+              <em v-if="result.is_history_version">历史版本 {{ result.matched_version }}</em>
+            </button>
+            <div v-if="messageSearchLoadingMore" class="archive-message-search-more"><span class="spinner small"></span>正在加载更多</div>
+          </div>
+        </div>
+      </section>
+
+      <div ref="messageViewport" :class="['archive-message-viewport', { 'is-prepending': loadingOlder }]" @scroll.passive="handleMessageScroll" @wheel.passive="handleMessageWheel" @pointerdown="handleMessagePointerDown">
         <div v-if="loadingMessages" class="archive-message-loading"><span class="spinner"></span><span>正在读取消息</span></div>
         <div v-else-if="!messages.length" class="archive-message-loading"><span>这个会话暂时没有可显示的消息</span></div>
         <div v-else :class="['archive-message-flow', { 'is-positioning': !messagePositionReady }]">
@@ -1596,6 +2849,7 @@ onBeforeUnmount(() => {
             <div v-if="showDate(index)" class="archive-date-separator" :data-date-label="dateLabel(entry.first.sent_at)"><span>{{ dateLabel(entry.first.sent_at) }}</span></div>
             <div
               :id="`archive-${entry.key}`"
+              :data-message-ids="entry.items.map((item) => item.message_id).join(' ')"
               :class="['archive-message-line', entryPosition(index), {
                 out: entry.first.out,
                 deleted: entryIsDeleted(entry),
@@ -1618,7 +2872,7 @@ onBeforeUnmount(() => {
                 <template v-else>{{ avatarText({ name: entrySenderName(entry) }) }}</template>
               </button>
               <div :class="['archive-message-content', { 'has-inline-buttons': entryButtons(entry).length }]">
-              <article :class="['archive-bubble', ...entryPresentation(entry).classes]">
+              <article :class="['archive-bubble', ...entryPresentation(entry).classes]" :style="visualMediaBubbleStyle(entry)">
                 <div v-if="entryViaBot(entry)" class="archive-via-bot"><span>via</span><a v-if="entryViaBot(entry)!.username" :href="`https://t.me/${entryViaBot(entry)!.username}`" target="_blank" rel="noopener">{{ viaBotLabel(entry) }}</a><strong v-else>{{ viaBotLabel(entry) }}</strong></div>
                 <strong v-if="showEntrySender(index, entry)" class="archive-sender">{{ entrySenderName(entry) }}</strong>
                 <div v-if="showsForwardHeader(entry)" class="archive-forward">
@@ -1635,7 +2889,7 @@ onBeforeUnmount(() => {
                 </button>
                 <template v-if="entryIsDeleted(entry)">
                   <p class="archive-deleted-copy"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13" /></svg>此消息已从 Telegram 删除</p>
-                  <button class="archive-preserved archive-version-trigger" @click="openMessageHistory(entry)">查看已保留的 {{ Math.max(0, entryVersions(entry) - 1) }} 个旧版本</button>
+                  <span class="archive-preserved">已保留 {{ Math.max(0, entryVersions(entry) - 1) }} 个旧版本</span>
                 </template>
                 <template v-else>
                   <p v-if="entryPresentation(entry).primary === 'unsupported'" class="archive-unsupported">此消息类型暂不支持</p>
@@ -1684,9 +2938,9 @@ onBeforeUnmount(() => {
                       :aria-label="`查看${mediaLabel(media)}`"
                       @click="activateMedia(entry, media)"
                     >
-                      <img v-if="isImageMedia(media)" :src="media.url" :alt="media.name || mediaLabel(media)" loading="lazy" @load="rememberMediaDimensions(media, $event)" />
-                      <img v-if="isVideoMedia(media) && mediaPosters[media.id]" class="archive-video-poster" :src="mediaPosters[media.id]" alt="" aria-hidden="true" />
-                      <video v-if="isVideoMedia(media)" class="archive-inline-video" autoplay muted loop playsinline preload="auto" disablepictureinpicture :poster="mediaPosters[media.id]" :src="media.url" @loadedmetadata="rememberVideoMetadata(media, $event)" @loadeddata="captureInlineVideoPoster(media, $event)" @timeupdate="handleInlineVideoTimeUpdate(media, $event)" @playing="handleInlineVideoPlayback($event, true)" @pause="handleInlineVideoPlayback($event, false)"></video>
+                      <img v-if="isImageMedia(media)" :src="mediaPreviewUrl(media)" :alt="media.name || mediaLabel(media)" loading="lazy" @load="rememberMediaDimensions(media, $event)" @error="handleMediaPreviewError(media, $event)" />
+                      <img v-if="isVideoMedia(media) && mediaPosterUrl(media)" class="archive-video-poster" :src="mediaPosterUrl(media)" alt="" aria-hidden="true" @load="rememberMediaDimensions(media, $event)" @error="handleMediaPreviewError(media, $event)" />
+                      <video v-if="isVideoMedia(media)" class="archive-inline-video archive-album-video" muted playsinline preload="metadata" disablepictureinpicture :poster="mediaPosterUrl(media)" :src="media.url" @loadedmetadata="rememberVideoMetadata(media, $event)" @loadeddata="captureInlineVideoPoster(media, $event)"></video>
                       <span v-if="isVideoMedia(media) && mediaDurations[media.id]" class="archive-video-duration">{{ media.type === 'animation' ? 'GIF' : formatMediaDuration(mediaRemaining[media.id] ?? mediaDurations[media.id]) }}</span>
                       <span v-if="isVideoMedia(media)" class="archive-video-badge"><svg viewBox="0 0 24 24"><path d="m9 7 8 5-8 5V7Z" /></svg></span>
                       <span v-if="mediaHasSpoiler(entry, media)" class="archive-spoiler-reveal"><svg viewBox="0 0 24 24"><path d="M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" /></svg>显示</span>
@@ -1696,7 +2950,7 @@ onBeforeUnmount(() => {
                   <div v-else-if="!entryWebPage(entry) && entry.media.length" class="archive-media-grid">
                     <div v-for="media in entry.media" :key="media.id" class="archive-media">
                       <button v-if="isImageMedia(media) && media.type !== 'sticker'" :class="['archive-visual', media.type, { 'media-spoiler-hidden': mediaHasSpoiler(entry, media) }]" :style="singleMediaStyle(media)" :aria-label="`查看${mediaLabel(media)}`" @click="activateMedia(entry, media)">
-                        <img :src="media.url" :alt="media.name || mediaLabel(media)" loading="lazy" @load="rememberMediaDimensions(media, $event)" />
+                        <img :src="mediaPreviewUrl(media)" :alt="media.name || mediaLabel(media)" loading="lazy" @load="rememberMediaDimensions(media, $event)" @error="handleMediaPreviewError(media, $event)" />
                         <span v-if="mediaHasSpoiler(entry, media)" class="archive-spoiler-reveal"><svg viewBox="0 0 24 24"><path d="M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" /></svg>显示</span>
                         <span v-if="mediaTtlSeconds(entry, media)" class="archive-ttl-badge">◉ {{ mediaTtlSeconds(entry, media) }} 秒</span>
                       </button>
@@ -1707,8 +2961,8 @@ onBeforeUnmount(() => {
                         <span v-if="mediaHasSpoiler(entry, media)" class="archive-spoiler-reveal"><svg viewBox="0 0 24 24"><path d="M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" /></svg>显示</span>
                       </span>
                       <button v-else-if="isVideoMedia(media)" :class="['archive-video-preview', { 'media-spoiler-hidden': mediaHasSpoiler(entry, media) }]" :style="singleMediaStyle(media)" aria-label="查看视频" @click="activateMedia(entry, media)">
-                        <img v-if="mediaPosters[media.id]" class="archive-video-poster" :src="mediaPosters[media.id]" alt="" aria-hidden="true" />
-                        <video class="archive-inline-video" autoplay muted loop playsinline preload="auto" disablepictureinpicture :poster="mediaPosters[media.id]" :src="media.url" @loadedmetadata="rememberVideoMetadata(media, $event)" @loadeddata="captureInlineVideoPoster(media, $event)" @timeupdate="handleInlineVideoTimeUpdate(media, $event)" @playing="handleInlineVideoPlayback($event, true)" @pause="handleInlineVideoPlayback($event, false)"></video>
+                        <img v-if="mediaPosterUrl(media)" class="archive-video-poster" :src="mediaPosterUrl(media)" alt="" aria-hidden="true" @load="rememberMediaDimensions(media, $event)" @error="handleMediaPreviewError(media, $event)" />
+                        <video class="archive-inline-video" autoplay muted loop playsinline preload="metadata" disablepictureinpicture :poster="mediaPosterUrl(media)" :src="media.url" @loadedmetadata="rememberVideoMetadata(media, $event)" @loadeddata="captureInlineVideoPoster(media, $event)" @timeupdate="handleInlineVideoTimeUpdate(media, $event)" @playing="handleInlineVideoPlayback($event, true)" @pause="handleInlineVideoPlayback($event, false)"></video>
                         <span v-if="mediaDurations[media.id]" class="archive-video-duration">{{ media.type === 'animation' ? 'GIF' : formatMediaDuration(mediaRemaining[media.id] ?? mediaDurations[media.id]) }}</span>
                         <span class="archive-video-badge large"><svg viewBox="0 0 24 24"><path d="m9 7 8 5-8 5V7Z" /></svg></span>
                         <span v-if="mediaHasSpoiler(entry, media)" class="archive-spoiler-reveal"><svg viewBox="0 0 24 24"><path d="M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" /></svg>显示</span>
@@ -1716,7 +2970,7 @@ onBeforeUnmount(() => {
                       </button>
                       <TelegramAudioPlayer v-else-if="isAudioMedia(media)" :media="media" :content="mediaContent(entry, media)" :own="entry.first.out" />
                       <a v-else :class="['archive-document', { 'has-thumbnail': isImageDocument(media) }]" :href="media.download_url">
-                        <span class="archive-document-icon"><img v-if="isImageDocument(media)" :src="media.url" alt="" loading="lazy" /><svg v-else viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7V3Zm7 0v5h5" /></svg></span>
+                        <span class="archive-document-icon"><img v-if="isImageDocument(media)" :src="mediaPreviewUrl(media)" alt="" loading="lazy" @error="handleMediaPreviewError(media, $event)" /><svg v-else viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7V3Zm7 0v5h5" /></svg></span>
                         <span><strong>{{ media.name || mediaLabel(media) }}</strong><small>{{ formatBytes(media.size_bytes) }}</small></span>
                       </a>
                       <span v-if="mediaTtlSeconds(entry, media) && isAudioMedia(media)" class="archive-ttl-note">Telegram 中为 {{ mediaTtlSeconds(entry, media) }} 秒限时媒体 · 归档副本不会自动销毁</span>
@@ -1726,7 +2980,7 @@ onBeforeUnmount(() => {
                     <template v-for="(part, partIndex) in richTextParts(entry.text, entryEntities(entry))" :key="partIndex"><TelegramCustomEmoji v-if="part.customEmojiId" :document-id="part.customEmojiId" :fallback="part.text" /><a v-else-if="part.href" :href="part.href" :class="[part.classes, { revealed: isTextSpoilerRevealed(entry.key, partIndex) }]" target="_blank" rel="noopener" @click="part.classes.includes('rich-spoiler') && revealTextSpoiler(entry.key, partIndex, $event)">{{ part.text }}</a><span v-else :class="[part.classes, { revealed: isTextSpoilerRevealed(entry.key, partIndex) }]" :role="part.classes.includes('rich-spoiler') ? 'button' : undefined" :tabindex="part.classes.includes('rich-spoiler') ? 0 : undefined" @click="part.classes.includes('rich-spoiler') && revealTextSpoiler(entry.key, partIndex, $event)" @keydown.enter="part.classes.includes('rich-spoiler') && revealTextSpoiler(entry.key, partIndex, $event)">{{ part.text }}</span></template>
                     <footer v-if="entryPresentation(entry).metaPosition === 'in-text'" class="archive-message-meta inline">
                       <span v-if="entryMetrics(entry).views" class="archive-views"><svg viewBox="0 0 24 24"><path d="M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" /></svg>{{ entryMetrics(entry).views }}</span>
-                      <button v-if="entryIsEdited(entry)" class="archive-version-trigger" @click.stop="openMessageHistory(entry)">已编辑</button><time>{{ formatTime(entry.last.sent_at) }}</time><svg v-if="entry.first.out" class="archive-delivery" viewBox="0 0 18 12" aria-hidden="true"><path d="m1.5 6.5 3 3 6-7M7.5 8.5l1 1 7-7" /></svg>
+                      <span v-if="entryIsEdited(entry)">已编辑</span><time>{{ formatTime(entry.last.sent_at) }}</time><svg v-if="entry.first.out" class="archive-delivery" viewBox="0 0 18 12" aria-hidden="true"><path d="m1.5 6.5 3 3 6-7M7.5 8.5l1 1 7-7" /></svg>
                     </footer>
                   </p>
                   <a v-if="entryWebPage(entry)" class="archive-web-preview" :href="entryWebPage(entry)!.url" target="_blank" rel="noopener">
@@ -1737,7 +2991,7 @@ onBeforeUnmount(() => {
                 <div v-if="entryMetrics(entry).reactions?.length" class="archive-reactions"><span v-for="(reaction, reactionIndex) in entryMetrics(entry).reactions" :key="reactionIndex">{{ reactionLabel(reaction.reaction) }} <small>{{ reaction.count || 0 }}</small></span></div>
                 <footer v-if="entryPresentation(entry).metaPosition === 'standalone' && entryPresentation(entry).primary !== 'service'" class="archive-message-meta">
                   <span v-if="entryMetrics(entry).views" class="archive-views"><svg viewBox="0 0 24 24"><path d="M2 12s3.7-6 10-6 10 6 10 6-3.7 6-10 6S2 12 2 12Zm10 2.5a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" /></svg>{{ entryMetrics(entry).views }}</span>
-                  <button v-if="entryIsEdited(entry)" class="archive-version-trigger" @click.stop="openMessageHistory(entry)">已编辑</button><time>{{ formatTime(entry.last.sent_at) }}</time><svg v-if="entry.first.out" class="archive-delivery" viewBox="0 0 18 12" aria-hidden="true"><path d="m1.5 6.5 3 3 6-7M7.5 8.5l1 1 7-7" /></svg>
+                  <span v-if="entryIsEdited(entry)">已编辑</span><time>{{ formatTime(entry.last.sent_at) }}</time><svg v-if="entry.first.out" class="archive-delivery" viewBox="0 0 18 12" aria-hidden="true"><path d="m1.5 6.5 3 3 6-7M7.5 8.5l1 1 7-7" /></svg>
                 </footer>
                 <svg
                   v-if="entryPresentation(entry).classes.includes('has-appendix') && ['standalone', 'group-last'].includes(entryPosition(index))"
@@ -1759,6 +3013,20 @@ onBeforeUnmount(() => {
                   </g>
                 </svg>
               </article>
+              <div v-if="entryVersions(entry) > 1 || entryIsDeleted(entry)" class="archive-message-actions">
+                <button
+                  type="button"
+                  :class="{ restored: entryIsRestored(entry) }"
+                  :aria-label="entryIsRestored(entry) ? '该消息已从受限前的备份版本恢复，查看历史版本' : '查看消息历史版本'"
+                  :title="entryIsRestored(entry) ? '已从受限前的备份版本恢复 · 点击查看历史' : '查看消息历史版本'"
+                  @click.stop="openMessageHistory(entry)"
+                >
+                  <svg class="history-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.35-5.65L4 8.7M4 4v4.7h4.7M12 8v4.3l3 1.7" /></svg>
+                  <span v-if="entryIsRestored(entry)" class="archive-restored-badge" aria-hidden="true">
+                    <svg viewBox="0 0 12 12"><path d="M3.5 4H2V2.5M2.3 3.6a4 4 0 1 1-.2 4.3M4.3 6.1l1.1 1.1 2.2-2.5" /></svg>
+                  </span>
+                </button>
+              </div>
               <div v-if="entryButtons(entry).length" class="archive-inline-buttons">
                 <div v-for="(row, rowIndex) in entryButtons(entry)" :key="rowIndex">
                   <template v-for="(button, buttonIndex) in row" :key="buttonIndex"><a v-if="button.url" :href="button.url" target="_blank" rel="noopener">{{ button.text }}</a><span v-else>{{ button.text }}</span></template>
@@ -1782,7 +3050,12 @@ onBeforeUnmount(() => {
 
     <Transition name="archive-info">
     <section v-if="selected && infoOpen" class="archive-info-pane" aria-label="会话归档信息">
-      <header><strong>会话信息</strong><button aria-label="关闭会话信息" @click="infoOpen = false"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg></button></header>
+      <header>
+        <button class="archive-info-back" aria-label="返回上一层" @click="closeInfoPane"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" /></svg></button>
+        <strong>会话信息</strong>
+        <button class="archive-info-close" aria-label="关闭会话信息" @click="closeInfoPane"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
+      </header>
+      <div ref="infoScroll" class="archive-info-scroll" @scroll.passive="handleSharedMediaScroll">
       <div class="archive-profile">
         <span :class="['chat-avatar', 'profile-avatar', { 'saved-messages-avatar': selected.is_self }]" :style="avatarHue(selected.peer_id)"><SavedMessagesIcon v-if="selected.is_self" /><img v-else-if="selected.avatar_url" :src="selected.avatar_url" :alt="`${selected.title}头像`" /><template v-else>{{ avatarText(selected) }}</template></span>
         <h2>{{ selected.title }}</h2><span v-if="selected.username">@{{ selected.username }}</span>
@@ -1819,48 +3092,74 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="sharedMediaLoading" class="archive-shared-state"><span class="spinner small"></span><span>正在读取</span></div>
         <div v-else-if="sharedMediaError" class="archive-shared-state error"><span>{{ sharedMediaError }}</span><button @click="loadSharedMedia(false)">重试</button></div>
-        <div v-else-if="!sharedMediaItems.length" class="archive-shared-state"><span>没有已归档的{{ sharedMediaTabs.find((tab) => tab.type === sharedMediaTab)?.label }}</span></div>
-        <div v-else-if="['media', 'gif'].includes(sharedMediaTab)" class="archive-shared-grid">
-          <button v-for="item in sharedMediaItems" :key="item.id" :aria-label="`查看${item.type === 'video' ? '视频' : item.type === 'animation' ? 'GIF' : '图片'}`" @click="openSharedMedia(item)" @contextmenu="openSharedContextMenu(item, $event)">
-            <img v-if="item.type === 'photo' || item.mime_type?.startsWith('image/')" :src="item.url" :alt="item.name || '共享媒体'" loading="lazy" />
-            <img v-else-if="sharedMediaPosters[item.id]" class="archive-shared-video-poster" :src="sharedMediaPosters[item.id]" :alt="item.name || '视频预览'" />
+        <div v-else-if="!sharedMediaTotal" class="archive-shared-state"><span>没有已归档的{{ sharedMediaTabs.find((tab) => tab.type === sharedMediaTab)?.label }}</span></div>
+        <div v-else-if="['media', 'gif'].includes(sharedMediaTab)" ref="sharedMediaVirtual" class="archive-shared-virtual visual" :style="{ height: `${sharedMediaVirtualHeight()}px` }" @pointerdown="handleSharedLongPressPointerDown" @pointermove="moveSharedLongPress" @pointerup="endSharedLongPress" @pointercancel="endSharedLongPress" @click.capture="consumeSharedLongPressActivation">
+          <template v-for="slot in sharedMediaVisibleSlots" :key="slot.index">
+          <button v-if="slot.item" class="archive-shared-virtual-item" :style="slot.style" :data-shared-index="slot.index" :aria-label="`查看${slot.item.type === 'video' ? '视频' : slot.item.type === 'animation' ? 'GIF' : '图片'}`" @click="openSharedMedia(slot.item)" @contextmenu="openSharedContextMenu(slot.item, $event)">
+            <img v-if="slot.item.type === 'photo' || slot.item.mime_type?.startsWith('image/')" :src="mediaPreviewUrl(slot.item)" :alt="slot.item.name || '共享媒体'" loading="lazy" @error="handleMediaPreviewError(slot.item, $event)" />
+            <img v-else-if="mediaPosterUrl(slot.item)" class="archive-shared-video-poster" :src="mediaPosterUrl(slot.item)" :alt="slot.item.name || '视频预览'" @error="handleMediaPreviewError(slot.item, $event)" />
             <video
               v-else
               class="archive-shared-video-loader"
-              :src="item.url"
-              :data-media-id="item.id"
+              :src="slot.item.url"
+              :data-media-id="slot.item.id"
               muted
               playsinline
               preload="metadata"
-              @loadedmetadata="startSharedVideoPoster(item, $event)"
-              @seeked="captureSharedVideoPoster(item, $event)"
+              @loadedmetadata="startSharedVideoPoster(slot.item, $event)"
+              @seeked="captureSharedVideoPoster(slot.item, $event)"
             ></video>
-            <span v-if="sharedMediaDuration(item)" class="archive-shared-duration">{{ sharedMediaDuration(item) }}</span>
-            <span v-else-if="item.type === 'animation'" class="archive-shared-duration">GIF</span>
+            <span v-if="sharedMediaDuration(slot.item)" class="archive-shared-duration">{{ sharedMediaDuration(slot.item) }}</span>
+            <span v-else-if="slot.item.type === 'animation'" class="archive-shared-duration">GIF</span>
+            <span v-if="slot.item.is_history_version" class="archive-shared-history-badge" :title="`历史版本 ${slot.item.version}`" aria-label="历史版本"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7v5h5M5.4 16.5A8 8 0 1 0 5 8.2L4 12m8-4v4l2.8 1.7" /></svg></span>
           </button>
+          <span v-else class="archive-shared-virtual-item placeholder" :style="slot.style"></span>
+          </template>
         </div>
-        <div v-else-if="sharedMediaTab === 'documents'" class="archive-shared-list files">
-          <a v-for="item in sharedMediaItems" :key="item.id" :href="item.download_url" @contextmenu="openSharedContextMenu(item, $event)">
+        <div v-else-if="sharedMediaTab === 'documents'" ref="sharedMediaVirtual" class="archive-shared-virtual archive-shared-list files" :style="{ height: `${sharedMediaVirtualHeight()}px` }" @pointerdown="handleSharedLongPressPointerDown" @pointermove="moveSharedLongPress" @pointerup="endSharedLongPress" @pointercancel="endSharedLongPress" @click.capture="consumeSharedLongPressActivation">
+          <template v-for="slot in sharedMediaVisibleSlots" :key="slot.index">
+          <a v-if="slot.item" class="archive-shared-virtual-item" :style="slot.style" :data-shared-index="slot.index" :href="slot.item.download_url" @contextmenu="openSharedContextMenu(slot.item, $event)">
             <span class="archive-shared-file-icon"><svg viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7V3Zm7 0v5h5" /></svg></span>
-            <span><strong>{{ item.name || '文件' }}</strong><small>{{ formatBytes(item.size_bytes) }} · {{ formatListTime(item.sent_at) }}</small></span>
+            <span><strong>{{ slot.item.name || '文件' }}</strong><small>{{ formatBytes(slot.item.size_bytes) }} · {{ formatListTime(slot.item.sent_at) }}</small></span>
+            <span v-if="slot.item.is_history_version" class="archive-shared-history-badge list" :title="`历史版本 ${slot.item.version}`" aria-label="历史版本"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7v5h5M5.4 16.5A8 8 0 1 0 5 8.2L4 12m8-4v4l2.8 1.7" /></svg></span>
           </a>
+          <span v-else class="archive-shared-virtual-item placeholder list" :style="slot.style"></span>
+          </template>
         </div>
-        <div v-else-if="sharedMediaTab === 'links'" class="archive-shared-list links">
-          <a v-for="item in sharedMediaItems" :key="item.id" :href="item.url" target="_blank" rel="noopener" @contextmenu="openSharedContextMenu(item, $event)"><span><strong>{{ item.content?.title || item.text || item.url }}</strong><small>{{ sharedMediaDomain(item) }} · {{ formatListTime(item.sent_at) }}</small></span><svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" /></svg></a>
+        <div v-else-if="sharedMediaTab === 'links'" ref="sharedMediaVirtual" class="archive-shared-virtual archive-shared-list links" :style="{ height: `${sharedMediaVirtualHeight()}px` }" @pointerdown="handleSharedLongPressPointerDown" @pointermove="moveSharedLongPress" @pointerup="endSharedLongPress" @pointercancel="endSharedLongPress" @click.capture="consumeSharedLongPressActivation">
+          <template v-for="slot in sharedMediaVisibleSlots" :key="slot.index"><a v-if="slot.item" class="archive-shared-virtual-item" :style="slot.style" :data-shared-index="slot.index" :href="slot.item.url" target="_blank" rel="noopener" @contextmenu="openSharedContextMenu(slot.item, $event)"><span><strong>{{ slot.item.content?.title || slot.item.text || slot.item.url }}</strong><small>{{ sharedMediaDomain(slot.item) }} · {{ formatListTime(slot.item.sent_at) }}</small></span><svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" /></svg></a><span v-else class="archive-shared-virtual-item placeholder list" :style="slot.style"></span></template>
         </div>
-        <div v-else class="archive-shared-list audio">
-          <div v-for="item in sharedMediaItems" :key="item.id" @contextmenu="openSharedContextMenu(item, $event)"><TelegramAudioPlayer :media="item" :content="item.content" :own="false" /><time>{{ formatListTime(item.sent_at) }}</time></div>
+        <div v-else ref="sharedMediaVirtual" class="archive-shared-virtual archive-shared-list audio" :style="{ height: `${sharedMediaVirtualHeight()}px` }" @pointerdown="handleSharedLongPressPointerDown" @pointermove="moveSharedLongPress" @pointerup="endSharedLongPress" @pointercancel="endSharedLongPress" @click.capture="consumeSharedLongPressActivation">
+          <template v-for="slot in sharedMediaVisibleSlots" :key="slot.index"><div v-if="slot.item" class="archive-shared-virtual-item" :style="slot.style" :data-shared-index="slot.index" @contextmenu="openSharedContextMenu(slot.item, $event)"><TelegramAudioPlayer :media="slot.item" :content="slot.item.content" :own="false" /><span class="archive-shared-list-meta"><time>{{ formatListTime(slot.item.sent_at) }}</time><span v-if="slot.item.is_history_version" class="archive-shared-history-badge list" :title="`历史版本 ${slot.item.version}`" aria-label="历史版本"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7v5h5M5.4 16.5A8 8 0 1 0 5 8.2L4 12m8-4v4l2.8 1.7" /></svg></span></span></div><span v-else class="archive-shared-virtual-item placeholder list" :style="slot.style"></span></template>
         </div>
-        <button v-if="sharedMediaHasMore" class="archive-shared-more" :disabled="sharedMediaLoadingMore" @click="loadSharedMedia(true)"><span v-if="sharedMediaLoadingMore" class="spinner small"></span>{{ sharedMediaLoadingMore ? '正在加载' : '显示更多' }}</button>
+        <div v-if="sharedMediaLoadingMore" class="archive-shared-range-loading" aria-live="polite"><span class="spinner small"></span></div>
       </section>
+      </div>
+      <div
+        ref="sharedScrollbar"
+        :class="['archive-gallery-scrollbar', { visible: sharedScrollbarVisible, dragging: sharedScrollbarDragging, 'show-bubble': sharedScrollbarBubbleVisible }]"
+        aria-hidden="true"
+      >
+        <span class="archive-gallery-scrollbar-bubble" :style="{ top: `${sharedScrollbarBubbleTop}px` }">{{ sharedScrollbarLabel }}</span>
+        <span
+          ref="sharedScrollbarThumb"
+          class="archive-gallery-scrollbar-thumb"
+          :style="{ transform: `translateY(${sharedScrollbarThumbTop}px)` }"
+          @pointerdown="handleSharedScrollbarPointerDown"
+          @pointermove="handleSharedScrollbarPointerMove"
+          @pointerup="endSharedScrollbarDrag"
+          @pointercancel="endSharedScrollbarDrag"
+          @lostpointercapture="endSharedScrollbarDrag()"
+        ><span><i></i><i></i></span></span>
+      </div>
     </section>
     </Transition>
 
     <main v-if="!selected" class="archive-message-pane archive-no-selection"><div><strong>选择一个会话</strong><span>查看已经备份到本地的消息</span></div></main>
 
-    <div v-if="senderProfile" class="archive-profile-overlay" role="dialog" aria-modal="true" :aria-label="`${senderProfile.name} 的资料`" @click.self="closeSenderProfile">
+    <div v-if="senderProfile" class="archive-profile-overlay" role="dialog" aria-modal="true" :aria-label="`${senderProfile.name} 的资料`" @click.self="closeSenderProfile()">
       <section class="archive-sender-profile-card">
-        <button ref="senderProfileCloseButton" class="archive-profile-close" aria-label="关闭资料卡" title="关闭" @click="closeSenderProfile"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
+        <button ref="senderProfileCloseButton" class="archive-profile-close" aria-label="关闭资料卡" title="关闭" @click="closeSenderProfile()"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         <div class="archive-sender-profile-hero">
           <span class="archive-sender-profile-avatar" :style="avatarHue(senderProfile.peer_id || 0)">
             <img v-if="senderProfileAvatar()" :src="senderProfileAvatar()!" :alt="`${senderProfileDetail?.display_name || senderProfile.name}头像`" />
@@ -1891,11 +3190,11 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <div v-if="historyMessage" class="archive-history-overlay" role="dialog" aria-modal="true" aria-label="消息历史版本" @click.self="closeMessageHistory">
+    <div v-if="historyMessage" class="archive-history-overlay" role="dialog" aria-modal="true" aria-label="消息历史版本" @click.self="closeMessageHistory()">
       <section class="archive-history-panel">
         <header>
           <span><strong>消息历史</strong><small>消息 #{{ historyMessage.message_id }} · 已保存 {{ historyData?.items.length || historyMessage.current_version }} 个版本</small></span>
-          <button aria-label="关闭消息历史" title="关闭" @click="closeMessageHistory"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
+          <button aria-label="关闭消息历史" title="关闭" @click="closeMessageHistory()"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         </header>
         <main>
           <div v-if="historyLoading" class="archive-history-state"><i></i><span>正在读取已保存的版本…</span></div>
@@ -1919,8 +3218,8 @@ onBeforeUnmount(() => {
                   <div v-for="media in version.media" :key="media.id" :class="['archive-history-media-item', media.type]">
                     <TgsSticker v-if="isTgsSticker(media)" :src="media.url" :alt="version.content.emoji || '动态贴纸'" />
                     <video v-else-if="isVideoSticker(media)" autoplay muted loop playsinline :src="media.url"></video>
-                    <img v-else-if="isImageMedia(media)" :src="media.url" :alt="media.name || mediaLabel(media)" loading="lazy" />
-                    <video v-else-if="isVideoMedia(media)" controls preload="metadata" playsinline :src="media.url"></video>
+                    <img v-else-if="isImageMedia(media)" :src="mediaPreviewUrl(media)" :alt="media.name || mediaLabel(media)" loading="lazy" @error="handleMediaPreviewError(media, $event)" />
+                    <video v-else-if="isVideoMedia(media)" controls preload="metadata" playsinline :poster="mediaPosterUrl(media)" :src="media.url"></video>
                     <TelegramAudioPlayer v-else-if="isAudioMedia(media)" :media="media" :content="version.content" :own="historyMessage.out" />
                     <a v-else :href="media.download_url"><span class="archive-document-icon"><svg viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7V3Zm7 0v5h5" /></svg></span><span><strong>{{ media.name || mediaLabel(media) }}</strong><small>{{ formatBytes(media.size_bytes) }}</small></span></a>
                   </div>
@@ -1948,7 +3247,7 @@ onBeforeUnmount(() => {
           <span>{{ Math.round(viewerZoom * 100) }}%</span>
           <button aria-label="放大" title="放大" @click="setViewerZoom(viewerZoom + .25)"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg></button>
           <a :href="activeViewerItem.media.download_url" aria-label="下载" title="下载"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 20h14" /></svg></a>
-          <button aria-label="关闭" title="关闭" @click="closeViewer"><svg viewBox="0 0 24 24"><path d="m5 5 14 14M19 5 5 19" /></svg></button>
+          <button aria-label="关闭" title="关闭" @click="closeViewer()"><svg viewBox="0 0 24 24"><path d="m5 5 14 14M19 5 5 19" /></svg></button>
         </div>
       </header>
       <button v-if="viewerZoom === 1" class="archive-viewer-nav previous" aria-label="上一项" :disabled="viewerIndex === 0" @click="moveViewer(-1)"><svg viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" /></svg></button>
@@ -1962,6 +3261,7 @@ onBeforeUnmount(() => {
         @pointermove="handleViewerPointerMove"
         @pointerup="handleViewerPointerUp"
         @pointercancel="handleViewerPointerUp"
+        @lostpointercapture="releaseViewerPointer($event.pointerId)"
       >
         <img v-if="!isVideoMedia(activeViewerItem.media)" :key="activeViewerItem.media.id" ref="viewerMedia" :src="activeViewerItem.media.url" :alt="activeViewerItem.media.name || mediaLabel(activeViewerItem.media)" draggable="false" :style="viewerMediaStyle()" />
         <video v-else :key="activeViewerItem.media.id" ref="viewerMedia" controls autoplay playsinline :src="activeViewerItem.media.url" draggable="false" :style="viewerMediaStyle()"></video>
@@ -1970,7 +3270,7 @@ onBeforeUnmount(() => {
       <footer class="archive-viewer-footer">
         <div v-if="activeAlbumItems.length" class="archive-viewer-thumbnails">
           <button v-for="item in activeAlbumItems" :key="item.media.id" :class="{ active: item.media.id === activeViewerItem.media.id }" @click="openMedia(item.media)">
-            <img v-if="!isVideoMedia(item.media)" :src="item.media.url" alt="" /><video v-else muted preload="metadata" :src="item.media.url"></video>
+            <img v-if="!isVideoMedia(item.media) || mediaPosterUrl(item.media)" :src="isVideoMedia(item.media) ? mediaPosterUrl(item.media) : mediaPreviewUrl(item.media)" alt="" @error="handleMediaPreviewError(item.media, $event)" /><video v-else muted preload="metadata" :src="item.media.url"></video>
           </button>
         </div>
         <span>{{ (viewerIndex || 0) + 1 }} / {{ activeViewerItems.length }}</span>
@@ -1996,7 +3296,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.archive-layout { height: 100vh; min-width: 0; display: grid; grid-template-columns: 20.25rem minmax(24rem, 1fr) 0; color: var(--text); background: #eef2f7; transition: grid-template-columns 320ms cubic-bezier(.2,.8,.2,1); }
+.archive-layout { height: 100vh; height: 100dvh; min-width: 0; display: grid; grid-template-columns: 20.25rem minmax(24rem, 1fr) 0; color: var(--text); background: #eef2f7; transition: grid-template-columns 320ms cubic-bezier(.2,.8,.2,1); }
 .archive-layout.info-open { grid-template-columns: 20.25rem minmax(24rem, 1fr) 19.25rem; }
 .archive-chat-pane, .archive-info-pane { min-width: 0; background: rgba(247,249,252,.88); backdrop-filter: blur(28px) saturate(150%); -webkit-backdrop-filter: blur(28px) saturate(150%); }
 .archive-chat-pane { display: grid; grid-template-rows: auto auto minmax(0,1fr); border-right: 1px solid rgba(45,60,85,.09); }
@@ -2027,6 +3327,26 @@ onBeforeUnmount(() => {
 .archive-empty.compact { min-height: 5rem; }
 .archive-message-pane { --archive-message-radius: .9375rem; --archive-message-radius-small: .375rem; --archive-message-list-width: 47.5rem; --archive-incoming-max-width: 29rem; --archive-outgoing-max-width: 30rem; min-width: 0; position: relative; display: grid; grid-template-rows: auto minmax(0,1fr) auto; overflow: hidden; background-color: #dfe8ef; background-image: linear-gradient(rgba(223,232,239,.78), rgba(223,232,239,.78)), url('../assets/chat-pattern.svg'), radial-gradient(circle at 18% 12%, rgba(70,165,225,.16), transparent 31%), radial-gradient(circle at 85% 78%, rgba(115,95,215,.12), transparent 29%); background-size: auto, 15rem 15rem, auto, auto; }
 .archive-thread-header { z-index: 3; min-width: 0; min-height: 3rem; padding: .25rem .75rem; display: flex; align-items: center; gap: .625rem; color: var(--text); background: rgba(248,250,253,.82); backdrop-filter: blur(24px) saturate(160%); -webkit-backdrop-filter: blur(24px) saturate(160%); box-shadow: 0 1px 0 rgba(45,60,85,.08); }
+.archive-message-search { position: absolute; z-index: 12; top: .3rem; left: 50%; width: min(46rem, calc(100% - 1rem)); transform: translateX(-50%); pointer-events: none; }
+.archive-message-search > header { min-height: 2.55rem; padding: .22rem .28rem; border: 1px solid rgba(65,80,105,.09); border-radius: 1.35rem; display: flex; align-items: center; gap: .2rem; color: var(--text); background: rgba(249,251,254,.96); box-shadow: 0 .4rem 1.5rem rgba(30,50,75,.18); backdrop-filter: blur(22px) saturate(165%); -webkit-backdrop-filter: blur(22px) saturate(165%); pointer-events: auto; animation: archive-search-materialize 150ms cubic-bezier(.2,.8,.2,1); }
+@keyframes archive-search-materialize { from { opacity: 0; transform: scale(.975) translateY(-.2rem); } to { opacity: 1; transform: none; } }
+.archive-message-search > header > button, .archive-message-search label > button { width: 2rem; height: 2rem; padding: 0; border: 0; border-radius: 50%; flex: none; display: grid; place-items: center; color: var(--muted); background: transparent; cursor: pointer; transition: color 130ms ease, background 130ms ease, transform 90ms ease-out; }
+.archive-message-search > header > button:hover:not(:disabled), .archive-message-search label > button:hover { color: var(--blue); background: rgba(8,122,245,.09); }.archive-message-search > header > button:active:not(:disabled), .archive-message-search label > button:active { transform: scale(.9); }.archive-message-search > header > button:disabled { opacity: .28; cursor: default; }
+.archive-message-search > header svg { width: 1rem; height: 1rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.archive-message-search > header > label { min-width: 0; min-height: 2rem; padding: 0 .25rem 0 .55rem; border-radius: 1rem; flex: 1; display: flex; align-items: center; gap: .4rem; color: var(--muted); background: rgba(80,95,120,.075); }
+.archive-message-search > header > label > svg { width: .95rem; flex: none; }
+.archive-message-search input { min-width: 0; width: 100%; border: 0; outline: 0; color: var(--text); background: transparent; font: inherit; font-size: .78rem; }
+.archive-message-search input::-webkit-search-cancel-button { display: none; }
+.archive-message-search-count { min-width: 3.4rem; color: var(--muted); text-align: center; white-space: nowrap; font-size: .62rem; font-variant-numeric: tabular-nums; }
+.archive-message-search-dropdown { width: calc(100% - 3rem); max-height: min(25rem, calc(100vh - 5rem)); margin: .3rem auto 0; overflow: hidden; border: 1px solid rgba(65,80,105,.09); border-radius: 1.05rem; color: var(--text); background: rgba(249,251,254,.97); box-shadow: 0 .65rem 2rem rgba(25,45,70,.2); backdrop-filter: blur(24px) saturate(165%); -webkit-backdrop-filter: blur(24px) saturate(165%); pointer-events: auto; animation: archive-search-materialize 150ms cubic-bezier(.2,.8,.2,1); }
+.archive-message-search-results { max-height: min(24rem, calc(100vh - 5.5rem)); padding: .35rem; overflow-y: auto; overscroll-behavior: contain; }
+.archive-message-search-results > button { width: 100%; min-width: 0; padding: .58rem .68rem; border: 0; border-radius: .72rem; display: grid; gap: .22rem; color: inherit; background: transparent; text-align: left; cursor: pointer; transition: background 120ms ease, transform 80ms ease-out; }
+.archive-message-search-results > button:hover { background: rgba(75,90,115,.07); }.archive-message-search-results > button.active { background: rgba(8,122,245,.12); }.archive-message-search-results > button:active { transform: scale(.992); }
+.archive-message-search-results > button > span { min-width: 0; display: flex; align-items: baseline; gap: .55rem; }.archive-message-search-results strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--blue); font-size: .7rem; }.archive-message-search-results time { flex: none; color: var(--muted); font-size: .58rem; }
+.archive-message-search-results small { overflow: hidden; color: var(--text); white-space: nowrap; text-overflow: ellipsis; font-size: .69rem; line-height: 1.35; }.archive-message-search-results mark { padding: .03rem .08rem; border-radius: .15rem; color: inherit; background: rgba(255,205,55,.42); }
+.archive-message-search-results em { width: fit-content; padding: .12rem .32rem; border-radius: 999px; color: #9a6c16; background: rgba(190,135,30,.12); font-size: .53rem; font-style: normal; font-weight: 720; }
+.archive-message-search-state { min-height: 6rem; padding: 1rem; display: flex; align-items: center; justify-content: center; gap: .45rem; color: var(--muted); text-align: center; font-size: .7rem; }.archive-message-search-state.error { flex-direction: column; color: #bd5560; }.archive-message-search-state button { padding: .35rem .58rem; border: 0; border-radius: .55rem; color: var(--blue); background: rgba(8,122,245,.1); cursor: pointer; font: inherit; font-weight: 700; }
+.archive-message-search-more { min-height: 2.7rem; display: flex; align-items: center; justify-content: center; gap: .4rem; color: var(--muted); font-size: .62rem; }
 .thread-avatar { width: 2.5rem; height: 2.5rem; }
 .archive-thread-title { min-width: 0; flex: 1; display: grid; gap: .16rem; }
 .archive-thread-title strong, .archive-thread-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2037,9 +3357,10 @@ onBeforeUnmount(() => {
 .archive-icon-button svg, .archive-back svg, .archive-info-pane header svg { width: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .archive-back { display: none; }
 .archive-message-viewport { min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: auto; scrollbar-width: thin; scrollbar-color: rgba(100,120,145,.36) transparent; }
-.archive-message-viewport::-webkit-scrollbar, .archive-chat-list::-webkit-scrollbar, .archive-info-pane::-webkit-scrollbar { width: .38rem; }
-.archive-message-viewport::-webkit-scrollbar-track, .archive-chat-list::-webkit-scrollbar-track, .archive-info-pane::-webkit-scrollbar-track { background: transparent; }
-.archive-message-viewport::-webkit-scrollbar-thumb, .archive-chat-list::-webkit-scrollbar-thumb, .archive-info-pane::-webkit-scrollbar-thumb { border: .08rem solid transparent; border-radius: 999px; background: rgba(100,120,145,.36); background-clip: padding-box; }
+.archive-message-viewport.is-prepending { overflow-anchor: none; }
+.archive-message-viewport::-webkit-scrollbar, .archive-chat-list::-webkit-scrollbar { width: .38rem; }
+.archive-message-viewport::-webkit-scrollbar-track, .archive-chat-list::-webkit-scrollbar-track { background: transparent; }
+.archive-message-viewport::-webkit-scrollbar-thumb, .archive-chat-list::-webkit-scrollbar-thumb { border: .08rem solid transparent; border-radius: 999px; background: rgba(100,120,145,.36); background-clip: padding-box; }
 .archive-message-flow { width: min(var(--archive-message-list-width), 100%); min-height: 100%; margin: 0 auto; padding: 1rem 1rem .8rem 1.125rem; box-sizing: border-box; display: flex; flex-direction: column; }
 .archive-message-flow.is-positioning { visibility: hidden; }
 .archive-message-flow::before { content: ''; margin-top: auto; }
@@ -2055,7 +3376,7 @@ onBeforeUnmount(() => {
 .archive-message-line.has-sender { grid-template-columns: 2rem minmax(0,1fr); }
 .archive-message-line.out { grid-template-columns: minmax(0,1fr); justify-items: end; }
 .archive-message-line.service-message { grid-template-columns: minmax(0,1fr); justify-items: center; margin: .5rem 0 1rem; }
-.archive-message-content { min-width: 0; width: fit-content; max-width: var(--archive-incoming-max-width); justify-self: start; }
+.archive-message-content { min-width: 0; width: fit-content; max-width: var(--archive-incoming-max-width); position: relative; justify-self: start; }
 .archive-message-line.out .archive-message-content { max-width: var(--archive-outgoing-max-width); justify-self: end; }
 .archive-message-content .archive-bubble { max-width: 100%; }
 .archive-message-content.has-inline-buttons .archive-bubble { width: 100%; border-bottom-left-radius: var(--archive-message-radius-small); border-bottom-right-radius: var(--archive-message-radius-small); }
@@ -2079,7 +3400,14 @@ onBeforeUnmount(() => {
 .archive-appendix-corner { fill: var(--bubble-color); }
 .archive-message-line:not(.out) .archive-appendix { left: -.5625rem; }
 .archive-message-line.out .archive-appendix { right: -.551rem; }
-.archive-bubble.album { width: fit-content; max-width: none; }
+.archive-bubble.album { width: var(--archive-album-width); max-width: none; box-sizing: border-box; }
+.archive-bubble.album.media-only { padding: 0; }
+.archive-bubble.album:not(.media-only) .archive-media-grid.album { margin-right: -.125rem; margin-left: -.125rem; }
+.archive-bubble.album:not(.media-only) > .archive-media-grid.album:first-child { margin-top: -.125rem; }
+.archive-bubble.visual-media { --single-media-max-height: 26rem; }
+.archive-bubble.visual-media:not(.album):not(.media-only) { width: calc(clamp(9rem, calc(var(--media-ratio, 1) * var(--single-media-max-height)), min(30rem, calc(100vw - 1.75rem))) + .25rem); box-sizing: border-box; }
+.archive-bubble.visual-media:not(.album):not(.media-only) .archive-visual,
+.archive-bubble.visual-media:not(.album):not(.media-only) .archive-video-preview { width: 100%; }
 .archive-bubble.sticker-only { --bubble-color: transparent; padding: 0 0 1.05rem; box-shadow: none; }
 .archive-bubble.sticker-only::after { display: none; }
 .archive-bubble.media-only { --bubble-color: transparent; padding: 0; background: transparent; box-shadow: none; }
@@ -2110,7 +3438,7 @@ onBeforeUnmount(() => {
 .archive-reply span, .archive-reply strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .archive-reply span { font-size: .64rem; }.archive-reply strong { color: inherit; font-size: .71rem; font-weight: 570; }
 .archive-media-grid { display: grid; gap: .12rem; overflow: hidden; border-radius: .8rem; }
-.archive-media-grid.album { position: relative; display: block; max-width: calc(100vw - 1.5rem); overflow: hidden; border-radius: .78rem; background: rgba(0,0,0,.12); }
+.archive-media-grid.album { position: relative; display: block; max-width: calc(100vw - 1.5rem); overflow: hidden; border-radius: inherit; background: rgba(0,0,0,.12); }
 .archive-album-tile { position: absolute; padding: 0; overflow: hidden; border: 0; color: white; background: #131820; cursor: zoom-in; }
 .archive-album-tile img, .archive-album-tile video { width: 100%; height: 100%; display: block; object-fit: cover; transition: transform 160ms ease-out, filter 160ms ease-out, opacity 90ms linear; }
 .archive-album-tile:hover img, .archive-album-tile:hover video { transform: scale(1.018); filter: brightness(.93); }
@@ -2211,6 +3539,14 @@ onBeforeUnmount(() => {
 .archive-version-trigger { padding: 0; border: 0; color: inherit; background: transparent; cursor: pointer; font: inherit; text-decoration: none; }
 .archive-version-trigger:hover { text-decoration: underline; text-underline-offset: .13rem; }
 .archive-preserved.archive-version-trigger { justify-self: start; color: #b06e77; }
+.archive-message-actions { position: absolute; z-index: 2; right: -2.2rem; bottom: .06rem; }
+.archive-message-line.out .archive-message-actions { right: auto; left: -2.2rem; }
+.archive-message-actions button { position: relative; width: 1.7rem; height: 1.7rem; padding: 0; border: 1px solid rgba(65,86,112,.1); border-radius: 50%; display: grid; place-items: center; color: #758397; background: rgba(248,250,253,.76); box-shadow: 0 2px 6px rgba(35,55,80,.1); backdrop-filter: blur(10px); cursor: pointer; transition: color 130ms ease, background-color 130ms ease, transform 90ms ease, box-shadow 130ms ease; }
+.archive-message-actions button:hover { color: var(--blue); background: rgba(255,255,255,.96); box-shadow: 0 3px 9px rgba(35,90,145,.16); }
+.archive-message-actions button:active { transform: scale(.92); }
+.archive-message-actions .history-icon { width: .94rem; height: .94rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.archive-restored-badge { position: absolute; right: -.28rem; bottom: -.24rem; width: .86rem; height: .86rem; border: 2px solid var(--archive-bg, #eef3f8); border-radius: 50%; display: grid; place-items: center; color: white; background: #c68119; box-shadow: 0 1px 3px rgba(111,72,14,.24); pointer-events: none; }
+.archive-restored-badge svg { width: .68rem; height: .68rem; fill: none; stroke: currentColor; stroke-width: 1.55; stroke-linecap: round; stroke-linejoin: round; }
 .archive-readonly-bar { min-height: 3.5rem; margin: .5rem auto .62rem; width: min(46rem, calc(100% - 1.25rem)); padding: .55rem .9rem; border: 0; border-radius: 1.35rem; display: flex; align-items: center; gap: .65rem; color: #617086; background: rgba(249,251,254,.88); backdrop-filter: blur(20px) saturate(160%); -webkit-backdrop-filter: blur(20px) saturate(160%); box-shadow: 0 5px 20px rgba(35,55,80,.14); }
 .archive-readonly-bar svg { width: 1.1rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }.archive-readonly-bar span { display: grid; gap: .08rem; }.archive-readonly-bar strong { color: var(--text); font-size: .7rem; }.archive-readonly-bar small { font-size: .62rem; }
 .archive-new-messages { position: absolute; z-index: 4; right: 1rem; bottom: 5.1rem; border: 0; border-radius: 999px; padding: .5rem .72rem; color: white; background: var(--blue); box-shadow: 0 8px 22px rgba(8,122,245,.26); cursor: pointer; font-weight: 700; font-size: .68rem; }
@@ -2220,11 +3556,14 @@ onBeforeUnmount(() => {
 .archive-jump-notice { position: absolute; z-index: 5; left: 50%; bottom: 5rem; transform: translateX(-50%); max-width: min(90%, 30rem); padding: .48rem .55rem .48rem .75rem; border-radius: 999px; display: flex; align-items: center; gap: .5rem; color: white; background: rgba(38,53,70,.86); box-shadow: 0 6px 20px rgba(20,35,55,.2); backdrop-filter: blur(16px); font-size: .7rem; }
 .archive-jump-notice button { width: 1.35rem; height: 1.35rem; border: 0; border-radius: 50%; color: inherit; background: rgba(255,255,255,.12); cursor: pointer; }
 @keyframes archive-message-highlight { 0%,100% { filter: none; } 25%,65% { filter: drop-shadow(0 0 .45rem rgba(24,146,242,.8)); } }
-.archive-info-pane { width: 19.25rem; min-width: 0; grid-column: 3; justify-self: end; overflow-y: auto; border-left: 1px solid rgba(45,60,85,.09); }
+.archive-info-pane { width: 19.25rem; min-width: 0; position: relative; grid-column: 3; justify-self: end; overflow: hidden; border-left: 1px solid rgba(45,60,85,.09); display: grid; grid-template-rows: auto minmax(0,1fr); }
+.archive-info-scroll { min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: none; -ms-overflow-style: none; }
+.archive-info-scroll::-webkit-scrollbar { display: none; }
 .archive-info-enter-active, .archive-info-leave-active { overflow: hidden; transition: opacity 180ms ease, transform 320ms cubic-bezier(.2,.8,.2,1); }
 .archive-info-enter-from, .archive-info-leave-to { opacity: 0; transform: translateX(1.25rem); }
 .archive-info-pane > header { min-height: 3rem; padding: .25rem .75rem; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 1px 0 rgba(45,60,85,.08); }
 .archive-info-pane > header strong { font-size: .9rem; }
+.archive-info-back { display: none !important; }
 .archive-profile { padding: 2.1rem 1rem 1.4rem; display: grid; justify-items: center; gap: .4rem; text-align: center; }
 .profile-avatar { width: 6rem; height: 6rem; font-size: 1.6rem; }.archive-profile h2 { margin: .35rem 0 0; font-size: 1.05rem; letter-spacing: -.02em; }.archive-profile > span:last-child { color: var(--muted); font-size: .72rem; }
 .archive-info-cards { padding: 0 .75rem; display: grid; gap: .6rem; }
@@ -2235,12 +3574,36 @@ onBeforeUnmount(() => {
 .archive-display-setting .switch { width: 2.45rem; height: 1.45rem; }.archive-display-setting .switch span { top: .15rem; left: .15rem; width: 1.15rem; height: 1.15rem; }.archive-display-setting .switch[aria-checked="true"] span { transform: translateX(1rem); }
 .archive-info-note { margin: 1rem; color: var(--muted); font-size: .68rem; line-height: 1.55; }
 .archive-shared-media { min-height: 15rem; padding-bottom: 1rem; position: relative; }
-.archive-shared-tabs { position: sticky; z-index: 3; top: 3rem; margin-top: .35rem; padding: .75rem .5rem .55rem; overflow-x: auto; display: flex; gap: .05rem; scrollbar-width: none; background: linear-gradient(to bottom, color-mix(in srgb, var(--surface) 98%, transparent) 72%, transparent); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }.archive-shared-tabs::-webkit-scrollbar { display: none; }
+.archive-shared-tabs { position: sticky; z-index: 3; top: 0; margin-top: .35rem; padding: .75rem .5rem .55rem; overflow-x: auto; display: flex; gap: .05rem; scrollbar-width: none; background: linear-gradient(to bottom, color-mix(in srgb, var(--surface) 98%, transparent) 72%, transparent); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }.archive-shared-tabs::-webkit-scrollbar { display: none; }
 .archive-shared-tabs button { min-width: 3.2rem; min-height: 2.2rem; padding: .35rem .55rem; border: 0; border-radius: .7rem; flex: 1 0 auto; color: var(--muted); background: transparent; cursor: pointer; font: inherit; font-size: .7rem; font-weight: 680; transition: color 150ms ease, background 150ms ease, transform 90ms ease-out; }.archive-shared-tabs button:hover { background: rgba(75,90,115,.07); }.archive-shared-tabs button:active { transform: scale(.96); }.archive-shared-tabs button.active { color: var(--blue); background: rgba(8,122,245,.11); }
 .archive-shared-kind-filter { min-height: 2.75rem; padding: .3rem .65rem .55rem; display: flex; justify-content: flex-end; gap: .35rem; }.archive-shared-kind-filter button { min-height: 1.9rem; padding: .28rem .58rem .28rem .45rem; border: 0; border-radius: 999px; display: inline-flex; align-items: center; gap: .28rem; color: var(--muted); background: rgba(75,90,115,.065); cursor: pointer; font: inherit; font-size: .62rem; font-weight: 680; transition: color 140ms ease, background 140ms ease, transform 90ms ease-out, opacity 140ms ease; }.archive-shared-kind-filter button:hover { background: rgba(75,90,115,.11); }.archive-shared-kind-filter button:active { transform: scale(.95); }.archive-shared-kind-filter button.active { color: var(--blue); background: rgba(8,122,245,.12); }.archive-shared-kind-filter button:disabled { cursor: default; opacity: 1; }.archive-shared-kind-filter svg { width: .9rem; height: .9rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }.archive-shared-kind-filter svg path:last-child { vector-effect: non-scaling-stroke; }
 .archive-shared-state { min-height: 11rem; padding: 1rem; display: flex; align-items: center; justify-content: center; gap: .45rem; color: var(--muted); text-align: center; font-size: .68rem; }.archive-shared-state.error { flex-direction: column; color: #bd5560; }.archive-shared-state button, .archive-shared-more { padding: .42rem .65rem; border: 0; border-radius: .65rem; color: var(--blue); background: rgba(8,122,245,.1); cursor: pointer; font: inherit; font-size: .65rem; font-weight: 700; }
 .archive-shared-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); grid-auto-rows: 1fr; gap: .0625rem; overflow: hidden; }.archive-shared-grid > button { position: relative; aspect-ratio: 1; min-width: 0; padding: 0; overflow: hidden; border: 0; background: #141920; cursor: zoom-in; }.archive-shared-grid img, .archive-shared-grid video { width: 100%; height: 100%; display: block; object-fit: cover; transition: transform 160ms ease-out, filter 160ms ease-out; }.archive-shared-video-loader { background: linear-gradient(135deg, #1b222c, #11161d); }.archive-shared-grid button:hover img, .archive-shared-grid button:hover video { transform: scale(1.025); filter: brightness(.91); }.archive-shared-grid button:active img, .archive-shared-grid button:active video { transform: scale(.985); transition-duration: 80ms; }.archive-shared-duration { position: absolute; left: .2rem; bottom: .2rem; padding: .08rem .22rem; border-radius: .2rem; color: white; background: rgba(15,20,27,.62); font-size: .58rem; font-weight: 700; line-height: 1.25; backdrop-filter: blur(5px); }
+.archive-shared-virtual { position: relative; min-height: 1px; overflow: hidden; }
+.archive-shared-virtual.visual .archive-shared-virtual-item { position: absolute; min-width: 0; padding: 0; overflow: hidden; border: 0; background: #141920; cursor: zoom-in; }
+.archive-shared-virtual-item, .archive-viewer-stage { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; }
+.archive-shared-virtual.visual img, .archive-shared-virtual.visual video { width: 100%; height: 100%; display: block; object-fit: cover; transition: transform 160ms ease-out, filter 160ms ease-out; }
+.archive-shared-virtual.visual button:hover img, .archive-shared-virtual.visual button:hover video { transform: scale(1.025); filter: brightness(.91); }
+.archive-shared-virtual.visual button:active img, .archive-shared-virtual.visual button:active video { transform: scale(.985); transition-duration: 80ms; }
+.archive-shared-virtual-item.placeholder { position: absolute; display: block; background: linear-gradient(110deg, rgba(95,110,130,.08) 25%, rgba(95,110,130,.14) 40%, rgba(95,110,130,.08) 55%); background-size: 220% 100%; animation: archive-shared-placeholder 1.15s linear infinite; }
+.archive-shared-virtual-item.placeholder.list { margin: .3rem .75rem; width: calc(100% - 1.5rem) !important; height: 3.65rem !important; border-radius: .7rem; }
+@keyframes archive-shared-placeholder { to { background-position-x: -220%; } }
+.archive-shared-history-badge { position: absolute; z-index: 2; top: .22rem; right: .22rem; width: 1.25rem; height: 1.25rem; border: 1px solid rgba(255,255,255,.34); border-radius: 50%; display: grid; place-items: center; color: white; background: rgba(23,31,43,.72); box-shadow: 0 1px 5px rgba(0,0,0,.22); backdrop-filter: blur(6px); pointer-events: none; }.archive-shared-history-badge svg { width: .82rem; height: .82rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }.archive-shared-history-badge.list { position: static; width: 1.35rem; height: 1.35rem; flex: none; color: #9a6c16; background: rgba(190,135,30,.12); border-color: rgba(190,135,30,.18); box-shadow: none; backdrop-filter: none; }
 .archive-shared-list { padding: .25rem .75rem; display: grid; }.archive-shared-list > a, .archive-shared-list.audio > div { min-width: 0; min-height: 3.9rem; padding: .55rem .15rem; display: flex; align-items: center; gap: .6rem; color: inherit; text-decoration: none; border-bottom: 1px solid rgba(75,90,115,.09); }.archive-shared-list > a:active { opacity: .72; }.archive-shared-list > a > span:not(.archive-shared-file-icon), .archive-shared-list.links a > span { min-width: 0; display: grid; gap: .14rem; }.archive-shared-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .7rem; }.archive-shared-list small, .archive-shared-list time { color: var(--muted); font-size: .58rem; }.archive-shared-file-icon { width: 2.5rem; height: 2.5rem; flex: none; border-radius: .65rem; display: grid; place-items: center; color: white; background: #3399df; }.archive-shared-file-icon svg { width: 1.2rem; fill: none; stroke: currentColor; stroke-width: 1.6; }.archive-shared-list.links a > svg { width: .9rem; margin-left: auto; flex: none; fill: none; stroke: var(--muted); stroke-width: 1.8; }.archive-shared-list.audio > div { display: grid; grid-template-columns: minmax(0,1fr) auto; }.archive-shared-list.audio .telegram-audio-player { min-width: 0; }.archive-shared-more { min-height: 2rem; margin: .65rem auto 0; display: flex; align-items: center; justify-content: center; gap: .35rem; }
+.archive-shared-virtual.archive-shared-list { padding: 0; display: block; }
+.archive-shared-virtual.archive-shared-list > a, .archive-shared-virtual.archive-shared-list.audio > div { position: absolute; box-sizing: border-box; padding-right: .9rem; padding-left: .9rem; }
+.archive-shared-list.files > a > span:nth-child(2) { flex: 1; }.archive-shared-list-meta { display: grid; justify-items: end; gap: .28rem; }.archive-shared-list.audio .archive-shared-history-badge.list { justify-self: end; }
+.archive-shared-range-loading { position: sticky; z-index: 3; bottom: .6rem; width: 2rem; height: 2rem; margin: -2.6rem auto .6rem; border-radius: 50%; display: grid; place-items: center; background: color-mix(in srgb, var(--solid-elevated) 88%, transparent); box-shadow: 0 .25rem .9rem rgba(25,40,60,.16); backdrop-filter: blur(10px); pointer-events: none; }
+.archive-gallery-scrollbar { position: absolute; z-index: 8; top: 3.5rem; right: 0; bottom: .5rem; width: 3.375rem; display: none; pointer-events: none; }
+.archive-gallery-scrollbar.visible { display: block; }
+.archive-gallery-scrollbar-thumb { position: absolute; top: 0; right: -.625rem; width: 2.625rem; height: 2.625rem; padding-left: .55rem; border-radius: 50%; display: flex; align-items: center; color: white; background: rgba(21,31,43,.72); box-shadow: 0 .25rem .9rem rgba(0,0,0,.28); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); cursor: grab; touch-action: none; pointer-events: auto; will-change: transform; }
+.archive-gallery-scrollbar.dragging .archive-gallery-scrollbar-thumb { background: rgba(43,61,79,.94); cursor: grabbing; }
+.archive-gallery-scrollbar-thumb > span { width: .75rem; height: 1rem; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: .2rem; pointer-events: none; }
+.archive-gallery-scrollbar-thumb i { width: 0; height: 0; border-right: .25rem solid transparent; border-left: .25rem solid transparent; }
+.archive-gallery-scrollbar-thumb i:first-child { border-bottom: .3125rem solid rgba(255,255,255,.88); }
+.archive-gallery-scrollbar-thumb i:last-child { border-top: .3125rem solid rgba(255,255,255,.88); }
+.archive-gallery-scrollbar-bubble { position: absolute; right: 2.375rem; min-width: 3.4rem; max-width: 8rem; padding: .35rem .58rem; border-radius: 999px; color: white; background: rgba(43,61,79,.94); box-shadow: 0 .25rem .9rem rgba(0,0,0,.24); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); opacity: 0; transform: translate(8px,-50%); transition: opacity 160ms ease, transform 160ms ease; pointer-events: none; white-space: nowrap; text-align: center; font-size: .62rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.archive-gallery-scrollbar.show-bubble .archive-gallery-scrollbar-bubble, .archive-gallery-scrollbar.dragging .archive-gallery-scrollbar-bubble { opacity: 1; transform: translate(0,-50%); }
 :global(.archive-shared-context-menu) { position: fixed; z-index: 1100; width: 11rem; padding: .32rem; border: 1px solid rgba(255,255,255,.42); border-radius: .82rem; color: var(--text); background: color-mix(in srgb, var(--solid-elevated) 90%, transparent); box-shadow: 0 .8rem 2.4rem rgba(5,12,24,.24); backdrop-filter: blur(24px) saturate(165%); -webkit-backdrop-filter: blur(24px) saturate(165%); transform-origin: top left; animation: archive-context-materialize 120ms cubic-bezier(.2,.8,.2,1); }
 :global(.archive-shared-context-menu button) { width: 100%; min-height: 2.35rem; padding: .42rem .62rem; border: 0; border-radius: .58rem; display: flex; align-items: center; gap: .58rem; color: inherit; background: transparent; cursor: pointer; font: inherit; font-size: .72rem; font-weight: 650; text-align: left; transition: background 110ms ease, transform 80ms ease-out; }
 :global(.archive-shared-context-menu button:hover), :global(.archive-shared-context-menu button:focus-visible) { outline: 0; background: rgba(8,122,245,.12); }
@@ -2280,7 +3643,7 @@ onBeforeUnmount(() => {
 .archive-viewer-tools { display: flex; align-items: center; gap: .2rem; }.archive-viewer-tools > span { min-width: 2.8rem; color: rgba(255,255,255,.7); text-align: center; font-size: .62rem; }
 .archive-viewer-tools button, .archive-viewer-tools a { width: 2.45rem; height: 2.45rem; padding: 0; border: 0; border-radius: 50%; display: grid; place-items: center; color: white; background: transparent; cursor: pointer; transition: background 130ms ease, transform 90ms ease-out; }.archive-viewer-tools button:hover, .archive-viewer-tools a:hover { background: rgba(255,255,255,.12); }.archive-viewer-tools button:active, .archive-viewer-tools a:active { transform: scale(.92); }.archive-viewer-tools svg { width: 1.15rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .archive-viewer-stage { min-width: 0; min-height: 0; position: absolute; z-index: 0; inset: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 4.5rem 0 4.2rem; touch-action: none; overscroll-behavior: none; cursor: zoom-in; user-select: none; -webkit-user-select: none; }
-.archive-viewer-stage img, .archive-viewer-stage video { max-width: 100vw; max-height: calc(100vh - 8.7rem); flex: none; object-fit: contain; box-shadow: 0 12px 55px rgba(0,0,0,.38); transform-origin: center; transition: transform 180ms cubic-bezier(.2,.8,.2,1); will-change: transform; -webkit-user-drag: none; }
+.archive-viewer-stage img, .archive-viewer-stage video { max-width: 100vw; max-height: calc(100dvh - 8.7rem); flex: none; object-fit: contain; box-shadow: 0 12px 55px rgba(0,0,0,.38); transform-origin: center; transition: transform 180ms cubic-bezier(.2,.8,.2,1); will-change: transform; -webkit-user-drag: none; }
 .archive-viewer.zoomed .archive-viewer-stage { cursor: grab; }
 .archive-viewer.dragging .archive-viewer-stage { cursor: grabbing; }
 .archive-viewer.dragging .archive-viewer-stage img, .archive-viewer.dragging .archive-viewer-stage video { transition: none; }
@@ -2296,28 +3659,69 @@ onBeforeUnmount(() => {
   .archive-info-enter-from, .archive-info-leave-to { opacity: 0; transform: translateX(100%); }
 }
 @media (max-width: 760px) {
-  .archive-workspace { height: calc(100vh - 4.7rem); }
-  .archive-layout { height: calc(100vh - 4.7rem); display: block; }
+  .archive-layout { height: 100%; display: block; }
   .archive-chat-pane, .archive-message-pane { width: 100%; height: 100%; }
   .archive-layout:not(.mobile-thread-open) .archive-message-pane, .archive-layout:not(.mobile-thread-open) .archive-info-pane { display: none; }
   .archive-layout.mobile-thread-open .archive-chat-pane { display: none; }
+  .archive-layout.mobile-thread-open.mobile-nav-forward .archive-message-pane { animation: archive-mobile-thread-enter 280ms cubic-bezier(.2,.8,.2,1); }
+  .archive-layout:not(.mobile-thread-open).mobile-nav-back .archive-chat-pane { animation: archive-mobile-list-return 260ms cubic-bezier(.2,.8,.2,1); }
+  .archive-layout.mobile-transition-forward .archive-info-enter-active, .archive-layout.mobile-transition-forward .archive-info-leave-active { transition-duration: 300ms; }
+  .archive-layout.mobile-transition-forward.mobile-from-thread.info-open .archive-message-pane { animation: archive-mobile-source-push 300ms cubic-bezier(.2,.8,.2,1) both; }
+  .archive-layout.mobile-transition-forward.mobile-from-thread .archive-info-enter-from { opacity: 1; transform: translateX(100%); }
+  .archive-layout.mobile-transition-forward.mobile-from-info .archive-info-leave-to { opacity: 1; transform: translateX(-24%); }
+  .archive-layout.mobile-transition-back.mobile-from-thread .archive-info-enter-from { opacity: .72; transform: translateX(-24%); }
+  .archive-layout.mobile-transition-forward.mobile-from-info .archive-message-pane { z-index: 26; animation: archive-mobile-deeper-chat-enter 300ms cubic-bezier(.2,.8,.2,1) both; will-change: transform; }
+  .archive-layout.mobile-transition-back.mobile-from-info .archive-message-pane { animation: archive-mobile-chat-return 280ms cubic-bezier(.2,.8,.2,1); }
+  .archive-list-header { padding-top: max(1.2rem, calc(env(safe-area-inset-top) + .65rem)); padding-right: max(1.1rem, env(safe-area-inset-right)); padding-left: max(1.1rem, env(safe-area-inset-left)); }
+  .archive-search { min-height: 2.75rem; margin-right: max(.8rem, env(safe-area-inset-right)); margin-left: max(.8rem, env(safe-area-inset-left)); }
+  .archive-search input, .archive-message-search input { font-size: 1rem; }
+  .archive-chat-list { padding-right: max(.45rem, env(safe-area-inset-right)); padding-bottom: max(.7rem, env(safe-area-inset-bottom)); padding-left: max(.45rem, env(safe-area-inset-left)); scroll-padding-bottom: 1rem; }
+  .archive-chat-item { min-height: 4.25rem; padding-top: .7rem; padding-bottom: .7rem; touch-action: manipulation; }
   .archive-back { display: grid; }
-  .archive-thread-header { min-height: 3rem; padding: .25rem .5rem; }
+  .archive-icon-button, .archive-back, .archive-info-pane header button { width: 2.75rem; height: 2.75rem; touch-action: manipulation; }
+  .archive-thread-header { min-height: calc(3.5rem + env(safe-area-inset-top)); padding: env(safe-area-inset-top) max(.35rem, env(safe-area-inset-right)) 0 max(.25rem, env(safe-area-inset-left)); gap: .35rem; }
+  .archive-thread-title span { max-width: 44vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .archive-message-search { top: calc(env(safe-area-inset-top) + .35rem); width: calc(100% - .6rem); }
+  .archive-message-search > header { padding-right: .18rem; padding-left: .18rem; }
+  .archive-message-search > header > button, .archive-message-search label > button { width: 2.5rem; height: 2.5rem; }
+  .archive-message-search > header > label { min-height: 2.5rem; }
+  .archive-message-search-dropdown { width: calc(100% - .5rem); max-height: calc(100dvh - 4.7rem - env(safe-area-inset-top)); }
+  .archive-message-search-results { max-height: calc(100dvh - 5.2rem - env(safe-area-inset-top)); }
+  .archive-message-search-results > button { min-height: 3.6rem; padding: .72rem; }
+  .archive-message-search-count { min-width: 2.9rem; }
   .thread-avatar { width: 2.35rem; height: 2.35rem; }
-  .archive-message-flow { width: 100%; padding: .75rem .5rem .8rem; }
+  .archive-message-viewport { touch-action: pan-y pinch-zoom; overscroll-behavior-y: contain; }
+  .archive-message-flow { width: 100%; padding: .75rem max(.5rem, env(safe-area-inset-right)) max(.8rem, env(safe-area-inset-bottom)) max(.5rem, env(safe-area-inset-left)); }
   .archive-bubble { max-width: min(var(--archive-incoming-max-width), calc(100vw - 6.25rem)); }
   .archive-message-line.out .archive-bubble { max-width: min(var(--archive-outgoing-max-width), calc(100vw - 3.75rem)); }
-  .archive-bubble.album { max-width: none; }
-  .archive-visual, .archive-video-preview { --single-media-max-height: 20rem; }
-  .archive-info-pane { width: 100%; top: 0; bottom: 0; }
-  .archive-readonly-bar { margin-bottom: .45rem; }
+  .archive-message-content { max-width: calc(100vw - 1rem); }
+  .archive-message-line.has-sender .archive-message-content { max-width: calc(100vw - 4rem); }
+  .archive-message-line.out .archive-message-content { max-width: calc(100vw - 1rem); }
+  .archive-bubble.album { max-width: 100%; }
+  .archive-bubble.album .archive-media-grid.album { max-width: 100%; }
+  .archive-bubble.visual-media, .archive-visual, .archive-video-preview { --single-media-max-height: 20rem; }
+  .archive-message-actions button { width: 2.1rem; height: 2.1rem; }
+  .archive-info-pane { width: 100%; height: 100vh; height: 100dvh; top: 0; bottom: auto; }
+  .archive-info-pane > header { min-height: calc(3.5rem + env(safe-area-inset-top)); padding: env(safe-area-inset-top) max(.45rem, env(safe-area-inset-right)) 0 max(.25rem, env(safe-area-inset-left)); justify-content: flex-start; gap: .35rem; }
+  .archive-info-back { display: grid !important; }
+  .archive-info-close { display: none !important; }
+  .archive-info-scroll { padding-bottom: env(safe-area-inset-bottom); }
+  .archive-shared-tabs button { min-height: 2.75rem; }
+  .archive-shared-kind-filter button { min-height: 2.5rem; }
+  .archive-readonly-bar { min-height: 3.25rem; margin-bottom: max(.45rem, env(safe-area-inset-bottom)); }
   .archive-viewer { grid-template-columns: 3rem minmax(0,1fr) 3rem; }
-  .archive-viewer-header { padding: .45rem .55rem; }.archive-viewer-tools > span { display: none; }.archive-viewer-tools button, .archive-viewer-tools a { width: 2.25rem; height: 2.25rem; }
-  .archive-viewer-stage { padding: 4.2rem 0 4.8rem; }.archive-viewer-stage img, .archive-viewer-stage video { max-height: calc(100vh - 9rem); }
-  .archive-viewer-nav { width: 2.5rem; height: 2.5rem; }
-  .archive-history-overlay { padding: 0; align-items: end; }.archive-history-panel { width: 100%; max-height: 88vh; border-radius: 1.15rem 1.15rem 0 0; border-bottom: 0; }.archive-history-panel > main { padding: .8rem .7rem 1.2rem; }
-  .archive-profile-overlay { padding: 0; align-items: end; }.archive-sender-profile-card { width: 100%; max-height: 88vh; border-radius: 1.35rem 1.35rem 0 0; border-bottom: 0; }
+  .archive-viewer-header { min-height: calc(4.25rem + env(safe-area-inset-top)); padding: env(safe-area-inset-top) max(.35rem, env(safe-area-inset-right)) 0 max(.55rem, env(safe-area-inset-left)); }.archive-viewer-tools > span { display: none; }.archive-viewer-tools button, .archive-viewer-tools a { width: 2.75rem; height: 2.75rem; }
+  .archive-viewer-stage { padding: calc(4.25rem + env(safe-area-inset-top)) 0 calc(4.8rem + env(safe-area-inset-bottom)); }.archive-viewer-stage img, .archive-viewer-stage video { max-height: calc(100dvh - 9.05rem - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+  .archive-viewer-footer { padding-bottom: max(.8rem, env(safe-area-inset-bottom)); }
+  .archive-viewer-nav { opacity: 0; pointer-events: none; }
+  .archive-history-overlay { padding: 0; align-items: end; }.archive-history-panel { width: 100%; max-height: 88vh; max-height: min(88dvh, calc(100dvh - env(safe-area-inset-top))); padding-bottom: env(safe-area-inset-bottom); border-radius: 1.15rem 1.15rem 0 0; border-bottom: 0; }.archive-history-panel > main { padding: .8rem .7rem 1.2rem; }
+  .archive-profile-overlay { padding: 0; align-items: end; }.archive-sender-profile-card { width: 100%; max-height: 88vh; max-height: min(88dvh, calc(100dvh - env(safe-area-inset-top))); padding-bottom: env(safe-area-inset-bottom); border-radius: 1.35rem 1.35rem 0 0; border-bottom: 0; }
 }
+@keyframes archive-mobile-thread-enter { from { opacity: .5; transform: translateX(16%); } to { opacity: 1; transform: none; } }
+@keyframes archive-mobile-list-return { from { opacity: .65; transform: translateX(-10%); } to { opacity: 1; transform: none; } }
+@keyframes archive-mobile-source-push { from { transform: none; } to { transform: translateX(-24%); } }
+@keyframes archive-mobile-deeper-chat-enter { from { opacity: 1; transform: translateX(100%); } to { opacity: 1; transform: none; } }
+@keyframes archive-mobile-chat-return { from { opacity: .7; transform: translateX(-10%); } to { opacity: 1; transform: none; } }
 @media (prefers-color-scheme: dark) {
   .archive-layout { background: #11151c; }
   .archive-chat-pane, .archive-info-pane { background: rgba(25,30,39,.94); border-color: rgba(255,255,255,.065); }
@@ -2326,6 +3730,10 @@ onBeforeUnmount(() => {
   .archive-chat-copy i { color: #d79ca3; background: rgba(215,90,100,.12); }
   .archive-message-pane { background-color: #0d1219; background-image: linear-gradient(rgba(13,18,25,.76), rgba(13,18,25,.76)), url('../assets/chat-pattern.svg'), radial-gradient(circle at 18% 12%, rgba(30,115,170,.14), transparent 30%), radial-gradient(circle at 85% 78%, rgba(95,73,178,.13), transparent 28%); background-size: auto, 15rem 15rem, auto, auto; }
   .archive-thread-header { background: rgba(23,28,36,.9); box-shadow: 0 1px 0 rgba(255,255,255,.065); }
+  .archive-message-search > header, .archive-message-search-dropdown { color: #f2f4f7; background: rgba(27,33,42,.97); border-color: rgba(255,255,255,.08); box-shadow: 0 .55rem 1.8rem rgba(0,0,0,.4); }
+  .archive-message-search > header > label { background: rgba(255,255,255,.065); }
+  .archive-message-search-results > button:hover { background: rgba(255,255,255,.055); }.archive-message-search-results > button.active { background: rgba(51,144,236,.17); }
+  .archive-message-search-results mark { background: rgba(224,174,35,.42); }
   .archive-bubble { --bubble-color: #222a35; color: #f2f4f7; background: var(--bubble-color); box-shadow: 0 1px 2px rgba(0,0,0,.34); }
   .archive-message-line.out .archive-bubble { --bubble-color: #7568c6; }
   .archive-message-line.out .archive-via-bot { color: #f0efff; }
@@ -2337,6 +3745,9 @@ onBeforeUnmount(() => {
   .archive-document { background: rgba(255,255,255,.075); }
   .archive-document small, .archive-message-meta { color: #aeb8c5; }
   .archive-message-line.out .archive-message-meta { color: rgba(255,255,255,.72); }
+  .archive-message-actions button { color: #a8b4c4; background: rgba(35,43,54,.78); border-color: rgba(255,255,255,.07); box-shadow: 0 2px 6px rgba(0,0,0,.24); }
+  .archive-message-actions button:hover { color: #72b9f1; background: #303b49; }
+  .archive-restored-badge { border-color: #111821; background: #c88927; }
   .archive-readonly-bar { background: rgba(27,33,42,.92); }
   .archive-info-cards > section { background: rgba(255,255,255,.045); }
   .archive-shared-tabs { background: linear-gradient(to bottom, rgba(25,30,39,.98) 72%, transparent); }.archive-shared-tabs button:hover { background: rgba(255,255,255,.05); }.archive-shared-list > a, .archive-shared-list.audio > div { border-color: rgba(255,255,255,.065); }
@@ -2346,14 +3757,18 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .archive-profile-overlay, .archive-sender-profile-card { animation: none; }
+  .archive-profile-overlay, .archive-sender-profile-card, .archive-message-search > header, .archive-message-search-dropdown { animation: none; }
   .archive-viewer-stage img, .archive-viewer-stage video { transition: none; }
+  .archive-gallery-scrollbar-bubble { transition: none; }
+  .archive-shared-virtual-item.placeholder { animation: none; }
   .archive-layout { transition: none; }
   .archive-info-enter-active, .archive-info-leave-active { transition: opacity 120ms ease; }
   .archive-info-enter-from, .archive-info-leave-to { transform: none; }
+  .archive-layout .archive-message-pane { animation: none !important; }
+  .archive-layout .archive-info-enter-from, .archive-layout .archive-info-leave-to { transform: none !important; }
 }
 @media (prefers-reduced-transparency: reduce) {
-  .archive-profile-overlay { backdrop-filter: none; -webkit-backdrop-filter: none; }.archive-sender-profile-card, :global(.archive-shared-context-menu) { background: var(--solid-elevated); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .archive-profile-overlay { backdrop-filter: none; -webkit-backdrop-filter: none; }.archive-sender-profile-card, :global(.archive-shared-context-menu), .archive-message-search > header, .archive-message-search-dropdown { background: var(--solid-elevated); backdrop-filter: none; -webkit-backdrop-filter: none; }.archive-gallery-scrollbar-thumb, .archive-gallery-scrollbar-bubble { backdrop-filter: none; -webkit-backdrop-filter: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .archive-message-viewport { scroll-behavior: auto; }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -10,14 +11,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from sqlalchemy import select, text, update
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from telethon import TelegramClient, errors, types
-from telethon.sessions import StringSession
 
 from .chat_identity import chat_display_title
 from .config import get_settings
-from .db import SessionLocal, engine
+from .db import SessionLocal
 from .entity_service import discover_entity
 from .models import (
     ChatBackupRule,
@@ -72,6 +73,20 @@ def create_client(
     )
 
 
+def account_session_stem(accounts_root: Path, user_id: int) -> Path:
+    """Derive an account's session location from its owning user."""
+    return (accounts_root / f"user_{user_id}" / "telegram").resolve()
+
+
+def candidate_session_stem(
+    accounts_root: Path, user_id: int, candidate_key: str
+) -> Path:
+    """Resolve a validated login candidate key below the pending directory."""
+    if not re.fullmatch(rf"user_{user_id}_[0-9a-f]{{32}}", candidate_key):
+        raise ValueError("invalid Telegram login candidate key")
+    return (accounts_root / "pending" / candidate_key).resolve()
+
+
 def dialog_kind(entity: Any) -> str:
     if isinstance(entity, types.User):
         return "bot" if entity.bot else "private"
@@ -82,14 +97,13 @@ def dialog_kind(entity: Any) -> str:
     return "unknown"
 
 
-def media_connection_limit(is_premium: bool) -> int:
+def media_stream_limit(is_premium: bool) -> int:
+    """Return the number of concurrent streams on the primary connection."""
     configured = (
         settings.telegram_media_parallel_connections_premium
         if is_premium
         else settings.telegram_media_parallel_connections_regular
     )
-    # Telegram Web A uses 3 connections for regular users and 6 for Premium.
-    # Keep the same hard ceiling even if the environment is misconfigured.
     return max(1, min(configured, 6))
 
 
@@ -98,7 +112,7 @@ class AccountRuntime:
     account_id: int
     user_id: int
     telegram_user_id: int
-    session_path: str
+    session_stem: Path
     client: TelegramClient
     state: str = "connecting"
     error: str | None = None
@@ -115,9 +129,8 @@ class AccountRuntime:
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     supervisor_task: asyncio.Task[None] | None = None
     dialog_task: asyncio.Task[None] | None = None
-    media_clients: list[TelegramClient] = field(default_factory=list)
-    media_clients_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     media_download_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    media_concurrency_disabled: bool = False
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -126,7 +139,7 @@ class AccountRuntime:
             "connection_error": self.error,
             "connected_at": self.connected_at.isoformat() if self.connected_at else None,
             "is_premium": self.is_premium,
-            "media_download_connections": media_connection_limit(self.is_premium),
+            "media_download_streams": media_stream_limit(self.is_premium),
             "last_dialog_refresh_at": (
                 self.last_dialog_refresh_at.isoformat()
                 if self.last_dialog_refresh_at
@@ -143,28 +156,43 @@ class TelegramRuntimeManager:
         self._started = False
         self._stopping = False
         self._instance_lock_connection: AsyncConnection | None = None
+        self._instance_lock_engine: AsyncEngine | None = None
 
     async def start(self) -> None:
         if self._started:
             return
-        lock_connection = await engine.connect()
+        # GET_LOCK must live for the whole process. Keep that permanent
+        # connection outside the request/worker pool so it cannot consume one
+        # of the web application's scarce reusable slots.
+        lock_engine = create_async_engine(
+            settings.database_url,
+            poolclass=NullPool,
+            pool_pre_ping=True,
+        )
+        lock_connection = await lock_engine.connect()
         acquired = await lock_connection.scalar(
             text("SELECT GET_LOCK(:name, 0)"),
             {"name": f"tg_backup_runtime:{settings.mysql_database}"},
         )
         if acquired != 1:
             await lock_connection.close()
+            await lock_engine.dispose()
             raise RuntimeError(
                 "已有 tgBackup 进程持有 Telegram 账号运行时；请使用单进程 Uvicorn"
             )
         self._instance_lock_connection = lock_connection
+        self._instance_lock_engine = lock_engine
         self._started = True
         self._stopping = False
-        async with SessionLocal() as db:
-            account_ids = list(await db.scalars(select(TelegramAccount.id)))
-        # Account recovery must not delay the web server becoming available.
-        for account_id in account_ids:
-            await self.start_account(account_id)
+        try:
+            async with SessionLocal() as db:
+                account_ids = list(await db.scalars(select(TelegramAccount.id)))
+            # Account recovery must not delay the web server becoming available.
+            for account_id in account_ids:
+                await self.start_account(account_id)
+        except BaseException:
+            await self.stop()
+            raise
 
     async def stop(self) -> None:
         if not self._started:
@@ -187,6 +215,9 @@ class TelegramRuntimeManager:
             finally:
                 await self._instance_lock_connection.close()
                 self._instance_lock_connection = None
+        if self._instance_lock_engine:
+            await self._instance_lock_engine.dispose()
+            self._instance_lock_engine = None
         self._started = False
 
     async def start_account(self, account_id: int) -> None:
@@ -194,11 +225,16 @@ class TelegramRuntimeManager:
             account = await db.get(TelegramAccount, account_id)
             if account is None:
                 return
+            session_stem = account_session_stem(
+                settings.account_sessions_root,
+                account.user_id,
+            )
+            session_stem.parent.mkdir(parents=True, exist_ok=True)
             values = (
                 account.id,
                 account.user_id,
                 account.telegram_user_id,
-                account.session_path,
+                session_stem,
             )
 
         previous: AccountRuntime | None
@@ -213,7 +249,7 @@ class TelegramRuntimeManager:
             account_id=values[0],
             user_id=values[1],
             telegram_user_id=values[2],
-            session_path=values[3],
+            session_stem=values[3],
             client=create_client(values[3]),
         )
         async with self._lock:
@@ -263,11 +299,6 @@ class TelegramRuntimeManager:
             await runtime.client.disconnect()
         except Exception:
             logger.exception("Failed to disconnect Telegram account %s", runtime.account_id)
-        await asyncio.gather(
-            *(client.disconnect() for client in runtime.media_clients),
-            return_exceptions=True,
-        )
-        runtime.media_clients.clear()
         runtime.state = "stopped"
         await self._publish_runtime(runtime)
 
@@ -287,7 +318,7 @@ class TelegramRuntimeManager:
                 runtime.error = None
                 await self._publish_runtime(runtime)
                 try:
-                    if not Path(runtime.session_path).with_suffix(".session").exists():
+                    if not runtime.session_stem.with_suffix(".session").exists():
                         await self._mark_invalid(
                             runtime, "login_required", "Telegram Session 文件不存在"
                         )
@@ -521,82 +552,26 @@ class TelegramRuntimeManager:
             if acquired:
                 runtime.operation_slots.release()
 
-    async def media_clients(
-        self,
-        account_id: int,
-        *,
-        count: int | None = None,
-        timeout: float | None = None,
-    ) -> list[TelegramClient]:
-        """Return persistent, independently connected read-only clients.
-
-        A StringSession snapshot copies the existing authorization key without
-        mutating the account's SQLite session. Workers disable updates and are
-        reused across files until the account runtime stops.
-        """
+    async def disable_parallel_media(self, account_id: int) -> None:
+        """Disable concurrent media streams until the account runtime restarts."""
         runtime = await self.ensure_account(account_id)
-        await self._wait_ready(runtime, timeout)
-        if count is None:
-            try:
-                async with asyncio.timeout(
-                    timeout or settings.telegram_runtime_ready_timeout_seconds
-                ):
-                    me = await runtime.client.get_me()
-                premium_now = bool(getattr(me, "premium", False))
-                if premium_now != runtime.is_premium:
-                    runtime.is_premium = premium_now
-                    await self._publish_runtime(runtime)
-            except (TelegramAuthorizationError, asyncio.CancelledError):
-                raise
-            except Exception:
-                logger.warning(
-                    "Unable to refresh Premium status for Telegram account %s; "
-                    "using the last known value",
-                    account_id,
-                )
-        wanted = max(1, min(count or media_connection_limit(runtime.is_premium), 6))
-        async with runtime.media_clients_lock:
-            while len(runtime.media_clients) < wanted:
-                session_string = StringSession.save(runtime.client.session)
-                worker = TelegramClient(
-                    StringSession(session_string),
-                    settings.telegram_api_id,
-                    settings.telegram_api_hash,
-                    proxy=settings.telegram_proxy(),
-                    auto_reconnect=True,
-                    connection_retries=5,
-                    request_retries=5,
-                    flood_sleep_threshold=60,
-                    receive_updates=False,
-                )
-                try:
-                    async with asyncio.timeout(
-                        timeout or settings.telegram_runtime_ready_timeout_seconds
-                    ):
-                        await worker.connect()
-                    if not await worker.is_user_authorized():
-                        raise TelegramAuthorizationError("下载连接的 Telegram 凭据已失效")
-                except BaseException:
-                    await worker.disconnect()
-                    raise
-                runtime.media_clients.append(worker)
-            return runtime.media_clients[:wanted]
+        runtime.media_concurrency_disabled = True
 
     @asynccontextmanager
-    async def media_download_clients(
+    async def media_download_slot(
         self,
         account_id: int,
         *,
-        count: int | None = None,
         timeout: float | None = None,
-    ) -> AsyncIterator[list[TelegramClient]]:
-        """Cap an account to one parallel file transfer at a time."""
+    ) -> AsyncIterator[int]:
+        """Cap an account to one ranged transfer on its primary client."""
         runtime = await self.ensure_account(account_id)
+        await self._wait_ready(runtime, timeout)
         async with runtime.media_download_lock:
-            yield await self.media_clients(
-                account_id,
-                count=count,
-                timeout=timeout,
+            yield (
+                1
+                if runtime.media_concurrency_disabled
+                else media_stream_limit(runtime.is_premium)
             )
 
     async def refresh_dialogs(

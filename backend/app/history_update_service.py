@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import case, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import types
 
 from .backup_service import (
@@ -21,7 +22,11 @@ from .backup_service import (
 )
 from .config import get_settings
 from .db import SessionLocal
-from .entity_service import discover_message_forward_sender, discover_message_sender
+from .entity_service import (
+    discover_message_forward_sender,
+    discover_message_sender,
+    require_message_sender_link,
+)
 from .models import (
     ArchivedMessage,
     ChatBackupRule,
@@ -105,6 +110,56 @@ async def ensure_history_state(rule_id: int) -> HistoryUpdateState:
             await db.commit()
             await db.refresh(state)
         return state
+
+
+async def history_sweep_progress(
+    db: AsyncSession,
+    state: HistoryUpdateState | None,
+    latest: HistoryUpdateRun | None,
+) -> dict[str, Any] | None:
+    """Return progress for the whole sweep rather than only its latest chunk."""
+    if latest is None:
+        return None
+    runs = [latest]
+    if state and state.sweep_cutoff_at:
+        runs = list(
+            (
+                await db.scalars(
+                    select(HistoryUpdateRun)
+                    .where(
+                        HistoryUpdateRun.rule_id == latest.rule_id,
+                        HistoryUpdateRun.started_at >= state.sweep_cutoff_at,
+                    )
+                    .order_by(HistoryUpdateRun.id)
+                )
+            ).all()
+        ) or [latest]
+    return summarize_history_sweep(runs, state)
+
+
+def summarize_history_sweep(
+    runs: list[HistoryUpdateRun],
+    state: HistoryUpdateState | None,
+) -> dict[str, Any] | None:
+    if not runs:
+        return None
+    current = runs[-1]
+    prior_checked = sum(run.checked_count for run in runs[:-1])
+    has_remaining = bool(state and state.next_run_at)
+    status = state.status if state and state.status in {"running", "error", "paused"} else current.status
+    if has_remaining and status not in {"running", "error", "paused", "failed"}:
+        status = "continuing"
+    return {
+        "id": current.id,
+        "status": status,
+        "candidate_count": prior_checked + current.candidate_count,
+        "checked_count": sum(run.checked_count for run in runs),
+        "changed_count": sum(run.changed_count for run in runs),
+        "deleted_count": sum(run.deleted_count for run in runs),
+        "media_completed_count": sum(run.media_completed_count for run in runs),
+        "error_count": sum(run.error_count for run in runs),
+        "has_remaining": has_remaining,
+    }
 
 
 def deletion_hash(message_id: int) -> str:
@@ -212,6 +267,11 @@ async def inspect_remote_message(
                         MessageVersion.version == archived.current_version,
                     )
                 )
+                if archived.sender_id is not None and (
+                    previous_version is None
+                    or previous_version.sender_entity_version_id is None
+                ):
+                    raise RuntimeError("删除版本无法继承消息发送者实体关联")
                 db.add(
                     MessageVersion(
                         archived_message_id=archived.id,
@@ -233,7 +293,6 @@ async def inspect_remote_message(
                 )
                 archived.current_version = next_version
                 archived.current_content_hash = digest
-                archived.content_hash_schema = 3
                 archived.history_update_count += 1
                 archived.is_deleted = True
                 changed = True
@@ -246,6 +305,7 @@ async def inspect_remote_message(
                 source="history_update",
                 priority=85,
             )
+            require_message_sender_link(remote, sender_entity, sender_version_id)
             await discover_message_forward_sender(
                 db,
                 rule.telegram_account_id,
@@ -258,23 +318,7 @@ async def inspect_remote_message(
                 archived.sender_entity_id = sender_entity.id
             stable = message_metadata(remote, detect_media_type(remote))
             digest = content_hash(remote, stable)
-            if archived.content_hash_schema < 3:
-                current = await db.scalar(
-                    select(MessageVersion).where(
-                        MessageVersion.archived_message_id == archived.id,
-                        MessageVersion.version == archived.current_version,
-                    )
-                )
-                archived.current_content_hash = digest
-                archived.content_hash_schema = 3
-                if current:
-                    current.content_hash = digest
-                    current.metadata_json = stable
-                    current.content_kind = str(stable.get("content_kind") or "unsupported")
-                    current.content_json = stable.get("content") or {}
-                    if current.sender_entity_version_id is None:
-                        current.sender_entity_version_id = sender_version_id
-            elif (
+            if (
                 archived.current_content_hash != digest
                 and archived.history_update_count < rule.history_max_updates
             ):
@@ -380,8 +424,6 @@ async def finish_history_run(
         state.status = "idle"
         state.last_completed_at = now
         state.next_run_at = now + timedelta(minutes=5) if has_remaining else None
-        if not has_remaining:
-            state.sweep_cutoff_at = None
         state.last_error_code = None
         state.last_error = None
         run.status = "partial" if run.error_count else "success"
@@ -451,7 +493,11 @@ async def history_update_rule(
             state_row.last_schedule_key = schedule_key
         state_row.last_error_code = None
         state_row.last_error = None
-        sweep_cutoff = state_row.sweep_cutoff_at or started
+        continuing_sweep = (
+            state_row.sweep_cutoff_at is not None
+            and state_row.next_run_at is not None
+        )
+        sweep_cutoff = state_row.sweep_cutoff_at if continuing_sweep else started
         state_row.sweep_cutoff_at = sweep_cutoff
         conditions = history_range_conditions(rule, started)
         candidate_count = await db.scalar(
@@ -475,6 +521,17 @@ async def history_update_rule(
         db.add(run)
         await db.flush()
         run_id = run.id
+        previous_runs = list(
+            (
+                await db.scalars(
+                    select(HistoryUpdateRun).where(
+                        HistoryUpdateRun.rule_id == rule_id,
+                        HistoryUpdateRun.id != run_id,
+                        HistoryUpdateRun.started_at >= sweep_cutoff,
+                    )
+                )
+            ).all()
+        )
 
     processed = 0
     changed_count = 0
@@ -482,13 +539,24 @@ async def history_update_rule(
     media_completed_count = 0
     error_count = 0
     total_candidates = candidate_count or 0
+    prior_checked = sum(item.checked_count for item in previous_runs)
+    prior_changed = sum(item.changed_count for item in previous_runs)
+    prior_deleted = sum(item.deleted_count for item in previous_runs)
+    prior_media_completed = sum(item.media_completed_count for item in previous_runs)
+    prior_errors = sum(item.error_count for item in previous_runs)
+    sweep_candidates = prior_checked + total_candidates
     await publish_history_event(
         account.user_id,
         "telegram.history.started",
         rule=rule,
         run_id=run_id,
         status="running",
-        candidate_count=total_candidates,
+        candidate_count=sweep_candidates,
+        checked_count=prior_checked,
+        changed_count=prior_changed,
+        deleted_count=prior_deleted,
+        media_completed_count=prior_media_completed,
+        error_count=prior_errors,
     )
     try:
         async with runtime_manager.client(account.id) as client:
@@ -574,12 +642,12 @@ async def history_update_rule(
                         rule=rule,
                         run_id=run_id,
                         status="running",
-                        candidate_count=total_candidates,
-                        checked_count=processed,
-                        changed_count=changed_count,
-                        deleted_count=deleted_count,
-                        media_completed_count=media_completed_count,
-                        error_count=error_count,
+                        candidate_count=sweep_candidates,
+                        checked_count=prior_checked + processed,
+                        changed_count=prior_changed + changed_count,
+                        deleted_count=prior_deleted + deleted_count,
+                        media_completed_count=prior_media_completed + media_completed_count,
+                        error_count=prior_errors + error_count,
                     )
         async with SessionLocal() as db:
             remaining = await db.scalar(
@@ -603,13 +671,13 @@ async def history_update_rule(
             "telegram.history.completed",
             rule=rule,
             run_id=run_id,
-            status="partial" if error_count else "success",
-            candidate_count=total_candidates,
-            checked_count=processed,
-            changed_count=changed_count,
-            deleted_count=deleted_count,
-            media_completed_count=media_completed_count,
-            error_count=error_count,
+            status="continuing" if remaining else ("partial" if error_count else "success"),
+            candidate_count=sweep_candidates,
+            checked_count=prior_checked + processed,
+            changed_count=prior_changed + changed_count,
+            deleted_count=prior_deleted + deleted_count,
+            media_completed_count=prior_media_completed + media_completed_count,
+            error_count=prior_errors + error_count,
             has_remaining=bool(remaining),
         )
         return run_id
@@ -622,12 +690,12 @@ async def history_update_rule(
             rule=rule,
             run_id=run_id,
             status="failed",
-            candidate_count=total_candidates,
-            checked_count=processed,
-            changed_count=changed_count,
-            deleted_count=deleted_count,
-            media_completed_count=media_completed_count,
-            error_count=error_count,
+            candidate_count=sweep_candidates,
+            checked_count=prior_checked + processed,
+            changed_count=prior_changed + changed_count,
+            deleted_count=prior_deleted + deleted_count,
+            media_completed_count=prior_media_completed + media_completed_count,
+            error_count=prior_errors + error_count,
             error_code=failure.code,
             error_message=failure.detail,
         )

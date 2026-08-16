@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 from weakref import WeakValueDictionary
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Cookie, HTTPException, Query
 from fastapi.responses import FileResponse
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from telethon import functions
 
 from .chat_identity import chat_display_title
 from .config import get_settings
 from .dependencies import CurrentUser, Db
+from .security import SESSION_COOKIE, digest
+from .media_preview import (
+    PreviewGenerationError,
+    ensure_media_preview,
+    preview_cache_path,
+    supports_preview,
+)
 from .models import (
     ArchivedMessage,
     ChatBackupRule,
@@ -23,6 +36,7 @@ from .models import (
     TelegramDialog,
     TelegramEntity,
     TelegramEntityPhoto,
+    WebSession,
 )
 from .telegram_runtime import (
     TelegramAuthorizationError,
@@ -36,6 +50,98 @@ settings = get_settings()
 custom_emoji_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = (
     WeakValueDictionary()
 )
+custom_emoji_slots = asyncio.Semaphore(
+    max(1, settings.custom_emoji_download_concurrency)
+)
+
+
+@dataclass(frozen=True)
+class AuthorizedMedia:
+    id: int
+    media_type: str
+    mime_type: str | None
+    original_name: str | None
+    relative_path: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class AuthorizedTelegramAccount:
+    user_id: int
+    account_id: int
+
+
+async def authorized_telegram_account(
+    db: AsyncSession,
+    session_token: str | None,
+) -> AuthorizedTelegramAccount:
+    if not session_token:
+        raise HTTPException(status_code=401, detail="请先登录")
+    row = (
+        await db.execute(
+            select(WebSession.id, WebSession.user_id, TelegramAccount.id, TelegramAccount.status)
+            .select_from(WebSession)
+            .outerjoin(
+                TelegramAccount,
+                TelegramAccount.user_id == WebSession.user_id,
+            )
+            .where(
+                WebSession.token_hash == digest(session_token),
+                WebSession.expires_at > datetime.now(timezone.utc),
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="登录已过期")
+    _, user_id, account_id, account_status = row
+    if account_id is None:
+        raise HTTPException(status_code=409, detail="请先连接 Telegram")
+    if account_status != "active":
+        raise HTTPException(status_code=409, detail="Telegram 登录已失效，请先重新登录")
+    return AuthorizedTelegramAccount(user_id=user_id, account_id=account_id)
+
+
+async def authorized_media(
+    db: AsyncSession,
+    media_id: int,
+    session_token: str | None,
+) -> AuthorizedMedia:
+    """Authenticate and resolve a media asset with one short DB checkout."""
+    if not session_token:
+        raise HTTPException(status_code=401, detail="请先登录")
+    row = (
+        await db.execute(
+            select(WebSession.id, MediaAsset, TelegramAccount.id)
+            .select_from(WebSession)
+            .outerjoin(MediaAsset, MediaAsset.id == media_id)
+            .outerjoin(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
+            .outerjoin(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
+            .outerjoin(
+                TelegramAccount,
+                and_(
+                    TelegramAccount.id == ArchivedMessage.telegram_account_id,
+                    TelegramAccount.user_id == WebSession.user_id,
+                ),
+            )
+            .where(
+                WebSession.token_hash == digest(session_token),
+                WebSession.expires_at > datetime.now(timezone.utc),
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=401, detail="登录已过期")
+    _, media, owner_account_id = row
+    if media is None or owner_account_id is None:
+        raise HTTPException(status_code=404, detail="媒体文件不存在")
+    return AuthorizedMedia(
+        id=media.id,
+        media_type=media.media_type,
+        mime_type=media.mime_type,
+        original_name=media.original_name,
+        relative_path=media.relative_path,
+        sha256=media.sha256,
+    )
 
 
 MEDIA_LABELS = {
@@ -49,6 +155,79 @@ MEDIA_LABELS = {
 }
 
 
+def is_server_restricted_placeholder(version: MessageVersion | None) -> bool:
+    if version is None or version.is_deleted or version.content_kind != "text":
+        return False
+    text = " ".join((version.text or "").strip().lower().replace("’", "'").split())
+    if not text.startswith(
+        (
+            "this channel ",
+            "this group ",
+            "this chat ",
+            "this message ",
+            "this bot ",
+            "this user ",
+        )
+    ):
+        return False
+    if not any(
+        phrase in text
+        for phrase in (
+            "can't be displayed",
+            "cannot be displayed",
+            "couldn't be displayed",
+            "could not be displayed",
+        )
+    ):
+        return False
+    return any(
+        reason in text
+        for reason in (
+            "terms of service",
+            "violat",
+            "local laws",
+            "copyright",
+            "pornographic content",
+            "sensitive content",
+        )
+    )
+
+
+async def display_versions(
+    db: AsyncSession,
+    current_pairs: list[tuple[ArchivedMessage, MessageVersion]],
+) -> dict[int, MessageVersion]:
+    """Use the latest normal snapshot when Telegram replaces media with a restriction notice."""
+    selected = {archived.id: version for archived, version in current_pairs}
+    restricted = {
+        archived.id: version.version
+        for archived, version in current_pairs
+        if is_server_restricted_placeholder(version)
+    }
+    if not restricted:
+        return selected
+    candidates = (
+        await db.scalars(
+            select(MessageVersion)
+            .where(MessageVersion.archived_message_id.in_(restricted))
+            .order_by(
+                MessageVersion.archived_message_id,
+                MessageVersion.version.desc(),
+            )
+        )
+    ).all()
+    resolved: set[int] = set()
+    for candidate in candidates:
+        archived_id = candidate.archived_message_id
+        if archived_id in resolved or candidate.version >= restricted.get(archived_id, 0):
+            continue
+        if candidate.is_deleted or is_server_restricted_placeholder(candidate):
+            continue
+        selected[archived_id] = candidate
+        resolved.add(archived_id)
+    return selected
+
+
 async def owned_account(db: Db, user_id: int) -> TelegramAccount:
     account = await db.scalar(
         select(TelegramAccount).where(TelegramAccount.user_id == user_id)
@@ -58,20 +237,31 @@ async def owned_account(db: Db, user_id: int) -> TelegramAccount:
     return account
 
 
-async def avatar_url(db: Db, entity: TelegramEntity | None) -> str | None:
-    if entity is None or entity.photo_id is None:
-        return None
-    photo_id = await db.scalar(
-        select(TelegramEntityPhoto.telegram_photo_id).where(
-            TelegramEntityPhoto.entity_id == entity.id,
-            TelegramEntityPhoto.telegram_photo_id == entity.photo_id,
-            TelegramEntityPhoto.variant == "small",
-            TelegramEntityPhoto.status == "available",
+async def avatar_urls(
+    db: Db, entities: list[TelegramEntity | None]
+) -> dict[int, str]:
+    entity_ids = {entity.id for entity in entities if entity and entity.photo_id}
+    if not entity_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                TelegramEntityPhoto.entity_id,
+                TelegramEntityPhoto.telegram_photo_id,
+            )
+            .join(TelegramEntity, TelegramEntity.id == TelegramEntityPhoto.entity_id)
+            .where(
+                TelegramEntityPhoto.entity_id.in_(entity_ids),
+                TelegramEntityPhoto.telegram_photo_id == TelegramEntity.photo_id,
+                TelegramEntityPhoto.variant == "small",
+                TelegramEntityPhoto.status == "available",
+            )
         )
-    )
-    if photo_id is None:
-        return None
-    return f"/api/entities/{entity.id}/avatar/{photo_id}/small"
+    ).all()
+    return {
+        entity_id: f"/api/entities/{entity_id}/avatar/{photo_id}/small"
+        for entity_id, photo_id in rows
+    }
 
 
 def message_preview(version: MessageVersion | None) -> str:
@@ -86,8 +276,11 @@ def message_preview(version: MessageVersion | None) -> str:
     return f"[{MEDIA_LABELS.get(str(media_type), '媒体')}]" if media_type else "空消息"
 
 
-def media_payload(media: MediaAsset) -> dict[str, object]:
-    return {
+def media_payload(
+    media: MediaAsset,
+    content: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "id": media.id,
         "type": media.media_type,
         "mime_type": media.mime_type,
@@ -96,6 +289,16 @@ def media_payload(media: MediaAsset) -> dict[str, object]:
         "url": f"/api/archive/media/{media.id}",
         "download_url": f"/api/archive/media/{media.id}?download=true",
     }
+    content = content or {}
+    width = content.get("width")
+    height = content.get("height")
+    if isinstance(width, (int, float)) and width > 0:
+        payload["width"] = width
+    if isinstance(height, (int, float)) and height > 0:
+        payload["height"] = height
+    if supports_preview(media.media_type, media.mime_type):
+        payload["preview_url"] = f"/api/archive/media/{media.id}/preview"
+    return payload
 
 
 SHARED_MEDIA_TYPES = {
@@ -188,61 +391,105 @@ async def archive_chats(user: CurrentUser, db: Db) -> dict[str, object]:
             .order_by(func.max(ArchivedMessage.sent_at).desc())
         )
     ).all()
-    items: list[dict[str, object]] = []
-    for peer_id, message_count, last_message_at in aggregates:
-        dialog_row = (
-            await db.execute(
-                select(TelegramDialog, TelegramEntity)
-                .outerjoin(TelegramEntity, TelegramEntity.id == TelegramDialog.entity_id)
-                .where(
-                    TelegramDialog.telegram_account_id == account.id,
-                    TelegramDialog.peer_id == peer_id,
-                )
-                .limit(1)
-            )
-        ).first()
-        dialog, entity = dialog_row if dialog_row else (None, None)
-        rule = await db.scalar(
-            select(ChatBackupRule).where(
-                ChatBackupRule.telegram_account_id == account.id,
-                ChatBackupRule.peer_id == peer_id,
+    if not aggregates:
+        return {"items": [], "count": 0}
+    peer_ids = [peer_id for peer_id, _, _ in aggregates]
+    dialog_rows = (
+        await db.execute(
+            select(TelegramDialog, TelegramEntity)
+            .outerjoin(TelegramEntity, TelegramEntity.id == TelegramDialog.entity_id)
+            .where(
+                TelegramDialog.telegram_account_id == account.id,
+                TelegramDialog.peer_id.in_(peer_ids),
             )
         )
-        state = (
-            await db.scalar(
-                select(ChatBackupState).where(ChatBackupState.rule_id == rule.id)
-            )
-            if rule
-            else None
-        )
-        latest_row = (
-            await db.execute(
-                select(ArchivedMessage, MessageVersion)
-                .join(
-                    MessageVersion,
-                    and_(
-                        MessageVersion.archived_message_id == ArchivedMessage.id,
-                        MessageVersion.version == ArchivedMessage.current_version,
-                    ),
+    ).all()
+    dialogs = {dialog.peer_id: (dialog, entity) for dialog, entity in dialog_rows}
+    rules = {
+        rule.peer_id: rule
+        for rule in (
+            await db.scalars(
+                select(ChatBackupRule).where(
+                    ChatBackupRule.telegram_account_id == account.id,
+                    ChatBackupRule.peer_id.in_(peer_ids),
                 )
+            )
+        ).all()
+    }
+    rule_ids = [rule.id for rule in rules.values()]
+    states = {
+        state.rule_id: state
+        for state in (
+            await db.scalars(
+                select(ChatBackupState).where(ChatBackupState.rule_id.in_(rule_ids))
+            )
+        ).all()
+    } if rule_ids else {}
+    latest_ids = (
+        select(
+            ArchivedMessage.peer_id.label("peer_id"),
+            func.max(ArchivedMessage.message_id).label("message_id"),
+        )
+        .where(
+            ArchivedMessage.telegram_account_id == account.id,
+            ArchivedMessage.peer_id.in_(peer_ids),
+        )
+        .group_by(ArchivedMessage.peer_id)
+        .subquery()
+    )
+    latest_rows = (
+        await db.execute(
+            select(ArchivedMessage, MessageVersion)
+            .join(
+                latest_ids,
+                and_(
+                    latest_ids.c.peer_id == ArchivedMessage.peer_id,
+                    latest_ids.c.message_id == ArchivedMessage.message_id,
+                ),
+            )
+            .join(
+                MessageVersion,
+                and_(
+                    MessageVersion.archived_message_id == ArchivedMessage.id,
+                    MessageVersion.version == ArchivedMessage.current_version,
+                ),
+            )
+            .where(ArchivedMessage.telegram_account_id == account.id)
+        )
+    ).all()
+    selected_latest = await display_versions(db, latest_rows)
+    latest_versions = {
+        message.peer_id: selected_latest[message.id]
+        for message, _ in latest_rows
+    }
+    media_counts = {
+        peer_id: count
+        for peer_id, count in (
+            await db.execute(
+                select(
+                    ArchivedMessage.peer_id,
+                    func.count(func.distinct(MediaAsset.relative_path)),
+                )
+                .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
+                .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
                 .where(
                     ArchivedMessage.telegram_account_id == account.id,
-                    ArchivedMessage.peer_id == peer_id,
+                    ArchivedMessage.peer_id.in_(peer_ids),
                 )
-                .order_by(ArchivedMessage.message_id.desc())
-                .limit(1)
+                .group_by(ArchivedMessage.peer_id)
             )
-        ).first()
-        _, latest_version = latest_row if latest_row else (None, None)
-        media_count = await db.scalar(
-            select(func.count(func.distinct(MediaAsset.relative_path)))
-            .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
-            .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
-            .where(
-                ArchivedMessage.telegram_account_id == account.id,
-                ArchivedMessage.peer_id == peer_id,
-            )
-        )
+        ).all()
+    }
+    entity_avatar_urls = await avatar_urls(
+        db, [entity for _, entity in dialogs.values()]
+    )
+
+    items: list[dict[str, object]] = []
+    for peer_id, message_count, last_message_at in aggregates:
+        dialog, entity = dialogs.get(peer_id, (None, None))
+        rule = rules.get(peer_id)
+        state = states.get(rule.id) if rule else None
+        latest_version = latest_versions.get(peer_id)
         fallback_title = (
             entity.display_name
             if entity and entity.display_name
@@ -267,9 +514,9 @@ async def archive_chats(user: CurrentUser, db: Db) -> dict[str, object]:
                 ),
                 "username": entity.username if entity else dialog.username if dialog else None,
                 "entity_id": entity.id if entity else None,
-                "avatar_url": await avatar_url(db, entity),
+                "avatar_url": entity_avatar_urls.get(entity.id) if entity else None,
                 "message_count": message_count,
-                "media_count": media_count or 0,
+                "media_count": media_counts.get(peer_id, 0),
                 "last_message": message_preview(latest_version),
                 "last_message_at": last_message_at,
                 "rule_status": (
@@ -421,6 +668,14 @@ async def archive_messages(
         )
     )
 
+    selected_versions = await display_versions(
+        db, [(archived, version) for archived, version, _ in rows]
+    )
+    rows = [
+        (archived, selected_versions[archived.id], sender)
+        for archived, _, sender in rows
+    ]
+
     version_ids = [version.id for _, version, _ in rows]
     media_by_version: dict[int, list[MediaAsset]] = {}
     if version_ids:
@@ -462,7 +717,15 @@ async def archive_messages(
                 )
             )
         ).all()
+        reply_selected_versions = await display_versions(
+            db,
+            [
+                (reply_message, reply_version)
+                for reply_message, reply_version, _ in reply_rows
+            ],
+        )
         for reply_message, reply_version, reply_sender in reply_rows:
+            reply_version = reply_selected_versions[reply_message.id]
             reply_previews[reply_message.message_id] = {
                 "message_id": reply_message.message_id,
                 "sender_name": (
@@ -474,7 +737,6 @@ async def archive_messages(
                 "is_deleted": reply_message.is_deleted or reply_version.is_deleted,
             }
 
-    sender_avatars: dict[int, str | None] = {}
     origin_peer_ids = {
         origin_peer_id
         for _, version, _ in rows
@@ -513,18 +775,19 @@ async def archive_messages(
                 )
             ).all()
         }
+    sender_avatars = await avatar_urls(
+        db,
+        [sender for _, _, sender in rows]
+        + list(origin_entities.values()),
+    )
     items: list[dict[str, object]] = []
     for archived, version, sender in rows:
-        if sender and sender.id not in sender_avatars:
-            sender_avatars[sender.id] = await avatar_url(db, sender)
         metadata = version.metadata_json or {}
         forward_info = metadata.get("forward")
         origin_peer_id = forward_origin_peer_id(forward_info)
         origin_sender = origin_entities.get(origin_peer_id) if origin_peer_id else None
         via_bot_id = metadata.get("via_bot_id")
         via_bot = via_bot_entities.get(int(via_bot_id)) if via_bot_id else None
-        if origin_sender and origin_sender.id not in sender_avatars:
-            sender_avatars[origin_sender.id] = await avatar_url(db, origin_sender)
         media_items = media_by_version.get(version.id, [])
         items.append(
             {
@@ -590,17 +853,19 @@ async def archive_messages(
                 "is_deleted": archived.is_deleted or version.is_deleted,
                 "is_edited": archived.current_version > 1 or version.edit_date is not None,
                 "current_version": archived.current_version,
+                "displayed_version": version.version,
+                "is_restored": version.version != archived.current_version,
                 "edit_date": version.edit_date,
                 "observed_at": version.observed_at,
                 "metrics": archived.volatile_metadata_json or {},
-                "media": [media_payload(media) for media in media_items],
+                "media": [
+                    media_payload(media, version.content_json)
+                    for media in media_items
+                ],
             }
         )
     return {
         "items": items,
-        # Keep the original fields for older clients. `has_more` means older
-        # pages are available, matching the former before-only pagination.
-        "has_more": has_older,
         "has_older": has_older,
         "has_newer": has_newer,
         "next_before_id": items[0]["message_id"] if items and has_older else None,
@@ -608,6 +873,87 @@ async def archive_messages(
         "requested_anchor_id": anchor_id,
         "anchor_id": resolved_anchor_id,
         "anchor_found": anchor_found,
+    }
+
+
+@router.get("/chats/{peer_id}/search")
+async def archive_message_search(
+    peer_id: int,
+    user: CurrentUser,
+    db: Db,
+    query: str = Query(alias="q", min_length=1, max_length=256),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=42, ge=1, le=100),
+) -> dict[str, object]:
+    """Search every saved text version and return one result per message."""
+    account = await owned_account(db, user.id)
+    normalized_query = " ".join(query.split())
+    if not normalized_query:
+        raise HTTPException(status_code=422, detail="搜索内容不能为空")
+
+    text_match = MessageVersion.text.contains(normalized_query, autoescape=True)
+    matching_versions = (
+        select(
+            MessageVersion.archived_message_id.label("archived_message_id"),
+            func.max(MessageVersion.version).label("matched_version"),
+        )
+        .where(MessageVersion.text.is_not(None), text_match)
+        .group_by(MessageVersion.archived_message_id)
+        .subquery()
+    )
+    base_conditions = [
+        ArchivedMessage.telegram_account_id == account.id,
+        ArchivedMessage.peer_id == peer_id,
+    ]
+    total_count = await db.scalar(
+        select(func.count())
+        .select_from(matching_versions)
+        .join(
+            ArchivedMessage,
+            ArchivedMessage.id == matching_versions.c.archived_message_id,
+        )
+        .where(*base_conditions)
+    ) or 0
+    rows = (
+        await db.execute(
+            select(ArchivedMessage, MessageVersion, TelegramEntity)
+            .join(
+                matching_versions,
+                matching_versions.c.archived_message_id == ArchivedMessage.id,
+            )
+            .join(
+                MessageVersion,
+                and_(
+                    MessageVersion.archived_message_id == ArchivedMessage.id,
+                    MessageVersion.version == matching_versions.c.matched_version,
+                ),
+            )
+            .outerjoin(
+                TelegramEntity,
+                TelegramEntity.id == ArchivedMessage.sender_entity_id,
+            )
+            .where(*base_conditions)
+            .order_by(ArchivedMessage.message_id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    return {
+        "items": [
+            {
+                "message_id": archived.message_id,
+                "sent_at": archived.sent_at,
+                "sender_name": sender.display_name if sender else None,
+                "text": version.text,
+                "matched_version": version.version,
+                "current_version": archived.current_version,
+                "is_history_version": version.version != archived.current_version,
+            }
+            for archived, version, sender in rows
+        ],
+        "total_count": total_count,
+        "offset": offset,
+        "has_more": offset + len(rows) < total_count,
     }
 
 
@@ -619,6 +965,9 @@ async def archive_shared_media(
     media_type: str = Query(default="media", alias="type"),
     media_filter: str = Query(default="all", pattern="^(all|photo|video)$"),
     before_id: int | None = Query(default=None, ge=1),
+    before_version: int | None = Query(default=None, ge=1),
+    before_media_id: int | None = Query(default=None, ge=1),
+    offset: int | None = Query(default=None, ge=0),
     limit: int = Query(default=60, ge=1, le=100),
 ) -> dict[str, object]:
     account = await owned_account(db, user.id)
@@ -633,21 +982,38 @@ async def archive_shared_media(
                 MessageVersion.text.op("REGEXP")(r"(https?://|tg://|t\\.me/)"),
             ),
         ]
-        if before_id is not None:
-            link_conditions.append(ArchivedMessage.message_id < before_id)
+        total_count = await db.scalar(
+            select(func.count())
+            .select_from(ArchivedMessage)
+            .join(
+                MessageVersion,
+                and_(
+                    MessageVersion.archived_message_id == ArchivedMessage.id,
+                    MessageVersion.version == ArchivedMessage.current_version,
+                ),
+            )
+            .where(*link_conditions)
+        ) or 0
+        paged_link_conditions = list(link_conditions)
+        if before_id is not None and offset is None:
+            paged_link_conditions.append(ArchivedMessage.message_id < before_id)
+        link_query = (
+            select(ArchivedMessage, MessageVersion)
+            .join(
+                MessageVersion,
+                and_(
+                    MessageVersion.archived_message_id == ArchivedMessage.id,
+                    MessageVersion.version == ArchivedMessage.current_version,
+                ),
+            )
+            .where(*paged_link_conditions)
+            .order_by(ArchivedMessage.message_id.desc())
+        )
+        if offset is not None:
+            link_query = link_query.offset(offset)
         link_rows = (
             await db.execute(
-                select(ArchivedMessage, MessageVersion)
-                .join(
-                    MessageVersion,
-                    and_(
-                        MessageVersion.archived_message_id == ArchivedMessage.id,
-                        MessageVersion.version == ArchivedMessage.current_version,
-                    ),
-                )
-                .where(*link_conditions)
-                .order_by(ArchivedMessage.message_id.desc())
-                .limit(limit + 1)
+                link_query.limit(limit + 1)
             )
         ).all()
         has_more = len(link_rows) > limit
@@ -667,42 +1033,74 @@ async def archive_shared_media(
                 }
                 for archived, version in link_rows
             ],
+            "total_count": total_count,
             "has_more": has_more,
             "next_before_id": link_rows[-1][0].message_id if has_more and link_rows else None,
         }
     conditions = [
         ArchivedMessage.telegram_account_id == account.id,
         ArchivedMessage.peer_id == peer_id,
-        MessageVersion.version == ArchivedMessage.current_version,
         MediaAsset.media_type.in_(shared_media_asset_types(media_type, media_filter)),
     ]
-    if before_id is not None:
-        conditions.append(ArchivedMessage.message_id < before_id)
-    rows = (
-        await db.execute(
-            select(MediaAsset, ArchivedMessage, MessageVersion)
-            .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
-            .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
-            .where(*conditions)
-            .order_by(ArchivedMessage.message_id.desc(), MediaAsset.id.desc())
-            .limit(limit + 1)
+    total_count = await db.scalar(
+        select(func.count(MediaAsset.id))
+        .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
+        .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
+        .where(*conditions)
+    ) or 0
+    if before_id is not None and offset is None:
+        if before_version is not None and before_media_id is not None:
+            conditions.append(
+                or_(
+                    ArchivedMessage.message_id < before_id,
+                    and_(
+                        ArchivedMessage.message_id == before_id,
+                        MessageVersion.version < before_version,
+                    ),
+                    and_(
+                        ArchivedMessage.message_id == before_id,
+                        MessageVersion.version == before_version,
+                        MediaAsset.id < before_media_id,
+                    ),
+                )
+            )
+        else:
+            conditions.append(ArchivedMessage.message_id < before_id)
+    media_query = (
+        select(MediaAsset, ArchivedMessage, MessageVersion)
+        .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
+        .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
+        .where(*conditions)
+        .order_by(
+            ArchivedMessage.message_id.desc(),
+            MessageVersion.version.desc(),
+            MediaAsset.id.desc(),
         )
-    ).all()
+    )
+    if offset is not None:
+        media_query = media_query.offset(offset)
+    rows = (await db.execute(media_query.limit(limit + 1))).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
     return {
         "items": [
             {
-                **media_payload(media),
+                **media_payload(media, version.content_json),
                 "message_id": archived.message_id,
                 "sent_at": archived.sent_at,
                 "text": version.text,
                 "content": version.content_json or {},
+                "version": version.version,
+                "current_version": archived.current_version,
+                "is_history_version": version.version != archived.current_version,
             }
             for media, archived, version in rows
         ],
+        "total_count": total_count,
         "has_more": has_more,
         "next_before_id": rows[-1][1].message_id if has_more and rows else None,
+        "next_before_version": rows[-1][2].version if has_more and rows else None,
+        "next_before_media_id": rows[-1][0].id if has_more and rows else None,
     }
 
 
@@ -761,7 +1159,7 @@ async def archive_message_versions(
                 "entities": message_entities_payload(metadata.get("entities")),
                 "post_author": metadata.get("post_author"),
                 "media": [
-                    media_payload(media)
+                    media_payload(media, version.content_json)
                     for media in media_by_version.get(version.id, [])
                 ],
             }
@@ -787,53 +1185,95 @@ def custom_emoji_extension(mime_type: str | None) -> str:
 @router.get("/custom-emojis/{document_id}")
 async def archive_custom_emoji(
     document_id: int,
-    user: CurrentUser,
     db: Db,
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
 ) -> FileResponse:
     if document_id <= 0:
         raise HTTPException(status_code=404, detail="自定义 Emoji 不存在")
-    account = await owned_account(db, user.id)
-    directory = settings.media_root / f"user_{user.id}" / "custom_emoji"
+    account = await authorized_telegram_account(db, session_token)
+    # No request waiting on a per-document lock, Telegram, or a file response
+    # should retain a checkout from the main SQLAlchemy pool.
+    await db.close()
+    directory = settings.media_root / f"user_{account.user_id}" / "custom_emoji"
     candidates = [
         directory / f"{document_id}{extension}"
         for extension in (".tgs", ".webm", ".webp", ".png", ".bin")
     ]
 
-    async def existing_file() -> Path | None:
+    def existing_file() -> Path | None:
         return next((path for path in candidates if path.is_file()), None)
 
-    path = await existing_file()
+    path = existing_file()
     if path is None:
-        lock = custom_emoji_locks.setdefault((account.id, document_id), asyncio.Lock())
+        lock = custom_emoji_locks.setdefault((account.account_id, document_id), asyncio.Lock())
         async with lock:
-            path = await existing_file()
+            path = existing_file()
             if path is None:
+                downloaded_path: Path | None = None
+                temporary: Path | None = None
                 try:
-                    async with runtime_manager.client(account.id) as client:
-                        documents = await client(
-                            functions.messages.GetCustomEmojiDocumentsRequest(
-                                document_id=[document_id]
-                            )
-                        )
-                        if not documents:
-                            raise HTTPException(
-                                status_code=404, detail="自定义 Emoji 不存在"
-                            )
-                        document = documents[0]
-                        directory.mkdir(parents=True, exist_ok=True)
-                        target = directory / (
-                            f"{document_id}"
-                            f"{custom_emoji_extension(getattr(document, 'mime_type', None))}"
-                        )
-                        downloaded = await client.download_media(document, file=str(target))
-                        downloaded_path = Path(downloaded) if downloaded else None
-                        path = target if target.is_file() else downloaded_path
+                    async with custom_emoji_slots:
+                        # Another document may have completed while this request
+                        # waited for the global Telegram download slot.
+                        path = existing_file()
+                        if path is None:
+                            async with asyncio.timeout(
+                                max(1, settings.custom_emoji_download_timeout_seconds)
+                            ):
+                                async with runtime_manager.client(account.account_id) as client:
+                                    documents = await client(
+                                        functions.messages.GetCustomEmojiDocumentsRequest(
+                                            document_id=[document_id]
+                                        )
+                                    )
+                                    if not documents:
+                                        raise HTTPException(
+                                            status_code=404, detail="自定义 Emoji 不存在"
+                                        )
+                                    document = documents[0]
+                                    directory.mkdir(parents=True, exist_ok=True)
+                                    target = directory / (
+                                        f"{document_id}"
+                                        f"{custom_emoji_extension(getattr(document, 'mime_type', None))}"
+                                    )
+                                    temporary = target.with_name(
+                                        f".{target.stem}.{uuid.uuid4().hex}.part{target.suffix}"
+                                    )
+                                    downloaded = await client.download_media(
+                                        document,
+                                        file=str(temporary),
+                                    )
+                                    downloaded_path = Path(downloaded) if downloaded else temporary
+                                    if not downloaded_path.is_file() or downloaded_path.stat().st_size <= 0:
+                                        raise HTTPException(
+                                            status_code=404,
+                                            detail="自定义 Emoji 下载失败",
+                                        )
+                                    os.replace(downloaded_path, target)
+                                    path = target
+                except TimeoutError as exc:
+                    raise HTTPException(
+                        status_code=504,
+                        detail="自定义 Emoji 下载超时",
+                    ) from exc
                 except TelegramAuthorizationError as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 except TelegramConnectionUnavailable as exc:
                     raise HTTPException(status_code=503, detail=str(exc)) from exc
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                    if (
+                        downloaded_path is not None
+                        and downloaded_path != path
+                        and downloaded_path != temporary
+                    ):
+                        downloaded_path.unlink(missing_ok=True)
                 if path is None or not path.is_file():
-                    raise HTTPException(status_code=404, detail="自定义 Emoji 下载失败")
+                    raise HTTPException(
+                        status_code=404,
+                        detail="自定义 Emoji 下载失败",
+                    )
 
     mime_type = {
         ".tgs": "application/x-tgsticker",
@@ -851,28 +1291,61 @@ async def archive_custom_emoji(
     )
 
 
+@router.get("/media/{media_id}/preview")
+async def archive_media_preview(
+    media_id: int,
+    db: Db,
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+) -> FileResponse:
+    media = await authorized_media(db, media_id, session_token)
+    # FFmpeg work can wait behind the two-slot preview queue. Return the DB
+    # connection before any filesystem or subprocess work begins.
+    await db.close()
+    if not supports_preview(media.media_type, media.mime_type):
+        raise HTTPException(status_code=415, detail="该媒体类型不支持预览图")
+
+    media_root = settings.media_root.resolve()
+    source = (media_root / media.relative_path).resolve()
+    try:
+        source.relative_to(media_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="媒体路径无效") from exc
+    if not source.is_file():
+        raise HTTPException(status_code=404, detail="媒体文件不存在")
+
+    target = preview_cache_path(
+        settings.media_preview_root.resolve(), media.id, media.sha256
+    )
+    try:
+        preview = await ensure_media_preview(
+            source,
+            target,
+            media_type=media.media_type,
+            ffmpeg_path=settings.ffmpeg_path,
+            max_width=settings.media_preview_max_width,
+            timeout_seconds=settings.media_preview_timeout_seconds,
+        )
+    except PreviewGenerationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return FileResponse(
+        preview,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "ETag": f'"preview-{media.sha256}"',
+        },
+    )
+
+
 @router.get("/media/{media_id}")
 async def archive_media(
     media_id: int,
-    user: CurrentUser,
     db: Db,
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
     download: bool = False,
 ) -> FileResponse:
-    row = (
-        await db.execute(
-            select(MediaAsset, TelegramAccount)
-            .join(MessageVersion, MessageVersion.id == MediaAsset.message_version_id)
-            .join(ArchivedMessage, ArchivedMessage.id == MessageVersion.archived_message_id)
-            .join(
-                TelegramAccount,
-                TelegramAccount.id == ArchivedMessage.telegram_account_id,
-            )
-            .where(MediaAsset.id == media_id, TelegramAccount.user_id == user.id)
-        )
-    ).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="媒体文件不存在")
-    media, _ = row
+    media = await authorized_media(db, media_id, session_token)
+    await db.close()
     root = settings.media_root.resolve()
     path = (root / media.relative_path).resolve()
     try:

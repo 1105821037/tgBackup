@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api, type OverviewActivity, type OverviewSummary } from '../api'
 import type { RealtimeEvent } from '../realtime'
+import { serverDate } from '../utils/dateTime'
 import TelegramConnect from './TelegramConnect.vue'
 
 const props = defineProps<{ username: string }>()
@@ -42,7 +43,7 @@ const heroSubtitle = computed(() => {
   if (!summary.value.account_bound) return '连接 Telegram 后，即可开始保存聊天记录。'
   if (!summary.value.rule_count) return '选择需要保存的会话，创建第一条自动备份规则。'
   if (summary.value.attention_task_count) return '本地归档保持可用，但有备份任务需要你的留意。'
-  return '你的 Telegram 消息正在安全地保存到本地归档。'
+  return '你的 Telegram 消息正在保存到本地归档。'
 })
 
 async function loadOverview(background = false) {
@@ -81,7 +82,7 @@ function formatBytes(value: number) {
 
 function formatTime(value?: string | null) {
   if (!value) return '尚无记录'
-  const date = new Date(value)
+  const date = serverDate(value)
   const elapsed = Date.now() - date.getTime()
   if (elapsed >= 0 && elapsed < 60_000) return '刚刚'
   if (elapsed >= 0 && elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)} 分钟前`
